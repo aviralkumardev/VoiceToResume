@@ -38,8 +38,7 @@ from app.meeting_room.stt_tts_pipeline.tts import build_tts
 # first thing the bot ever says, no LLM involved. It doubles as
 # InterviewDirector's opening question (see ask_opening_question).
 GREETING_MESSAGE = (
-    "Hi! To get started, could you please walk me through your education, "
-    "work experience, and skills?"
+    "Hi, welcome! I’ll help you build your resume through a short conversation. To get started, tell me about your education, any work experience, personal projects you’ve worked on, and your main skills. Take your time and walk me through each area."
 )
 
 

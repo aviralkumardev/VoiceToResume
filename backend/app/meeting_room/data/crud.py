@@ -296,6 +296,7 @@ class InMemoryResumeRoomCRUD:
         forced_topic: Optional[str] = None,
         max_questions: Optional[int] = None,
         target: Optional[Dict[str, Any]] = None,
+        turn_latency_seconds: Optional[float] = None,
     ) -> Optional[str]:
         """Opens a brand-new round for `question_text` and returns its id.
 
@@ -308,7 +309,13 @@ class InMemoryResumeRoomCRUD:
         "field"}` (the latter two optional/nullable) describing what this
         round's question is about -- stored verbatim so a later
         UNABLE_TO_ANSWER grade can be committed back into
-        field_completeness precisely."""
+        field_completeness precisely. `turn_latency_seconds`, when given, is
+        the elapsed `time.monotonic()` seconds between the PREVIOUS answer
+        being recorded and this question being queued for TTS -- the caller
+        (`InterviewDirector`) computes this directly rather than leaving it
+        to be derived from `asked_at`/`answered_at` timestamp arithmetic;
+        `None` for the opening question / idle recovery, which have no
+        preceding graded answer."""
         async with self._lock:
             row = self._sessions.get(session_id)
             if row is None:
@@ -329,7 +336,10 @@ class InMemoryResumeRoomCRUD:
                     else settings.resume_room_max_questions_per_round
                 ),
                 "exchanges": [
-                    {"question": question_text, "answer": None, "asked_at": now, "answered_at": None},
+                    {
+                        "question": question_text, "answer": None, "asked_at": now, "answered_at": None,
+                        "latency_seconds": turn_latency_seconds,
+                    },
                 ],
                 "opened_at": now,
                 "closed_at": None,
@@ -342,9 +352,19 @@ class InMemoryResumeRoomCRUD:
             return round_id
 
 
-    async def append_round_question(self, session_id: str, round_id: str, question_text: str) -> None:
+    async def append_round_question(
+        self,
+        session_id: str,
+        round_id: str,
+        question_text: str,
+        *,
+        turn_latency_seconds: Optional[float] = None,
+    ) -> None:
         """Appends a probe exchange to an already-open round -- same round,
-        same forced_topic/max_questions, one more question/answer pair."""
+        same forced_topic/max_questions, one more question/answer pair.
+        `turn_latency_seconds` -- see `start_round`'s docstring; same
+        measurement, landing on this probe exchange instead of a round's
+        first one."""
         async with self._lock:
             row = self._sessions.get(session_id)
             if row is None:
@@ -358,15 +378,25 @@ class InMemoryResumeRoomCRUD:
             round_row["exchanges"].append({
                 "question": question_text, "answer": None,
                 "asked_at": now_iso(), "answered_at": None,
+                "latency_seconds": turn_latency_seconds,
             })
             questions["current_round_id"] = round_id
             questions["awaiting_answer"] = True
             self._schedule_write(session_id, row)
 
 
-    async def record_round_answer(self, session_id: str, round_id: str, answer_text: str) -> None:
+    async def record_round_answer(
+        self, session_id: str, round_id: str, answer_text: str, *, answered_at: Optional[str] = None,
+    ) -> None:
         """Fills in the answer/answered_at on the round's most recent
-        unanswered exchange and clears awaiting_answer."""
+        unanswered exchange and clears awaiting_answer. `answered_at`, when
+        given, should be the moment the answer was finalized (silence
+        debounce elapsed, right before grading started) -- callers that defer
+        this write until after a grading LLM call has returned must pass the
+        earlier timestamp explicitly, or `asked_at`/`answered_at` on the NEXT
+        exchange minus this one would measure nothing but this call's own
+        deferral instead of real turn latency. Falls back to now() only if no
+        better timestamp is given."""
         async with self._lock:
             row = self._sessions.get(session_id)
             if row is None:
@@ -380,7 +410,7 @@ class InMemoryResumeRoomCRUD:
             for exchange in reversed(round_row["exchanges"]):
                 if exchange.get("answer") is None:
                     exchange["answer"] = answer_text
-                    exchange["answered_at"] = now_iso()
+                    exchange["answered_at"] = answered_at or now_iso()
                     break
 
             questions["awaiting_answer"] = False

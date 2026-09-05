@@ -39,15 +39,16 @@ class Settings(BaseSettings):
     resume_room_final_pass_model: str = "openai/gpt-5.6-terra:nitro"
     resume_room_final_pass_max_tokens: int = 4000
 
-    resume_room_silence_hardbound_seconds: float = 2.0
+    resume_room_silence_hardbound_seconds: float = 0.1
     resume_room_completeness_provider: str = "openrouter"
     resume_room_completeness_model: str = "openai/gpt-5.6-luna:nitro"
     resume_room_completeness_max_tokens: int = 3000
-    resume_room_answer_silence_seconds: float = 1.0
+    resume_room_answer_silence_seconds: float = 0.1
 
     resume_room_question_provider: str = "openai"
     resume_room_question_model: str = "gpt-5.6-terra"
     resume_room_question_max_tokens: int = 3000
+    resume_room_question_reasoning_effort: str = "none"
 
     resume_room_max_questions_per_round: int = 2
 

@@ -591,19 +591,26 @@ class InterviewDirector:
                 await self._handle_meta_question(result["meta_response"])
                 return
 
-            try:
-                await asyncio.shield(
-                    self._crud.record_round_answer(self._session_id, round_id, answer_text)
-                )
-            except asyncio.CancelledError:
-                pass
+            # Kick off the answer-persistence write now (asyncio.shield starts
+            # it running immediately) but don't block on it until AFTER the
+            # next question/probe has already been queued for TTS below --
+            # this write doesn't affect what gets spoken next, only
+            # bookkeeping, so it shouldn't sit on the critical path.
+            record_answer_task = asyncio.shield(
+                self._crud.record_round_answer(self._session_id, round_id, answer_text)
+            )
 
             grade = result.get("answer_grade")
             llm_usage = result.get("_llm_usage")
             probe_question = result.get("probe_question")
             terminal = grade in TERMINAL_GRADES
 
-            row = await self._crud.get_session(self._session_id)
+            # round_row/budget/spent come from `row` (fetched above, before
+            # this turn's answer was recorded) rather than a fresh
+            # get_session -- record_round_answer only fills in an existing
+            # exchange's `answer` field (crud.py), it never changes the
+            # exchange count, and nothing else touches questions.rounds
+            # concurrently, so this is already accurate.
             round_row = (
                 ((row or {}).get("questions") or {}).get("rounds", {}).get(round_id)
             ) or {}
@@ -620,6 +627,10 @@ class InterviewDirector:
 
             if not terminal and not capped and probe_question:
                 await self._probe_round(probe_question)
+                try:
+                    await record_answer_task
+                except asyncio.CancelledError:
+                    pass
                 return
 
             if not terminal and not capped:
@@ -640,21 +651,26 @@ class InterviewDirector:
                     )
                     self._awaiting_answer = True
                     self._buffer = [answer_text] + self._buffer
+                    try:
+                        await record_answer_task
+                    except asyncio.CancelledError:
+                        pass
                     return
                 logger.warning(
                     "grading round {} produced nothing usable {} times -- moving on",
                     round_id, self._regrade_attempts,
                 )
 
-            try:
-                await asyncio.shield(
-                    self._crud.close_round(
-                        self._session_id, round_id, grade=grade, llm_usage=llm_usage,
-                    )
+            # Same deferral as record_answer_task above: start these writes
+            # now, but don't wait on them until after _advance_round below
+            # has already queued the next question's TTS frame.
+            close_round_task = asyncio.shield(
+                self._crud.close_round(
+                    self._session_id, round_id, grade=grade, llm_usage=llm_usage,
                 )
-            except asyncio.CancelledError:
-                pass
+            )
 
+            field_completeness_task = None
             if grade == ANSWER_GRADE_UNABLE_TO_ANSWER:
                 # The one verdict the batched completeness worker can never
                 # infer on its own (a decline leaves no resume_data value for
@@ -664,15 +680,12 @@ class InterviewDirector:
                 closing_target = (round_row or {}).get("target")
                 if closing_target:
                     patch = build_unable_to_answer_patch(
-                        row.get("field_completeness") or {}, closing_target
+                        (row or {}).get("field_completeness") or {}, closing_target
                     )
                     if patch:
-                        try:
-                            await asyncio.shield(
-                                self._crud.apply_field_completeness(self._session_id, patch)
-                            )
-                        except asyncio.CancelledError:
-                            pass
+                        field_completeness_task = asyncio.shield(
+                            self._crud.apply_field_completeness(self._session_id, patch)
+                        )
 
             if self._current_round_forced:
                 self._forced_topics_spent.add(self._current_round_forced)
@@ -680,6 +693,14 @@ class InterviewDirector:
             self._current_round_forced = None
 
             await self._advance_round(result.get("next_question"), result.get("next_question_target"))
+
+            try:
+                await record_answer_task
+                await close_round_task
+                if field_completeness_task is not None:
+                    await field_completeness_task
+            except asyncio.CancelledError:
+                pass
         except asyncio.CancelledError:
             if not graded:
                 # The candidate resumed speaking while we were grading, so

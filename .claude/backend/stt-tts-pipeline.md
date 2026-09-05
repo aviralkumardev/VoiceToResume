@@ -158,29 +158,49 @@ four methods that manage it (`start_round`/`append_round_question`/
    `{question, answer}` slot (unlike the old free-form per-target message
    log) and filling it with the off-topic aside would leave no open slot
    for the real answer that follows once the pending question is re-spoken.
-4. Otherwise records the answer (`crud.record_round_answer`, shielded),
-   computes `capped` from the round's exchange count vs. its stamped
-   `max_questions`, and branches on `answer_grade`:
+4. Otherwise starts `crud.record_round_answer` as a shielded task (created,
+   not yet awaited — see "Bookkeeping writes deferred past the TTS queue"
+   below), computes `capped` from the round's exchange count vs. its stamped
+   `max_questions` (read from the row already fetched in step 1, not a fresh
+   `get_session` — `record_round_answer` only fills in an existing
+   exchange's `answer` field, never changes the count), and branches on
+   `answer_grade`:
    - **non-terminal (`PARTIAL`), under cap, `probe_question` present** →
-     `_probe_round(probe_question)` — same round, same subject.
+     `_probe_round(probe_question)` (queues the probe's `TTSSpeakFrame`
+     first), *then* awaits the `record_round_answer` task.
    - **non-terminal, under cap, no probe at all** (a fail-soft empty result,
      or a response that ignored the always-draft instruction) → restore the
-     answer to `self._buffer` with `_awaiting_answer` re-armed, so the next
-     silence re-grades the whole thing through the same call, bounded by
+     answer to `self._buffer` with `_awaiting_answer` re-armed (then await
+     the `record_round_answer` task), so the next silence re-grades the
+     whole thing through the same call, bounded by
      `InterviewDirector._MAX_REGRADE_ATTEMPTS` (1).
-   - **terminal, or capped** → `crud.close_round(..., grade=...)`; if the
-     grade is `UNABLE_TO_ANSWER`, reads the closing round's own stored
-     `target` and, if set, builds a patch via
+   - **terminal, or capped** → starts `crud.close_round(..., grade=...)` as
+     another shielded task; if the grade is `UNABLE_TO_ANSWER`, reads the
+     closing round's own stored `target` (from the same already-fetched
+     row) and, if set, builds a patch via
      `build_unable_to_answer_patch(field_completeness, target)` and, if
-     non-empty, commits it with a shielded
-     `crud.apply_field_completeness` — the one write path around the
-     batched grader's structural inability to ever detect a verbal decline
-     on its own (see
+     non-empty, starts a shielded `crud.apply_field_completeness` task too —
+     the one write path around the batched grader's structural inability to
+     ever detect a verbal decline on its own (see
      [backend/completeness-pipeline.md](completeness-pipeline.md)). Only for
      `UNABLE_TO_ANSWER` — `SUFFICIENT`/`PARTIAL` stay exclusively Task A's
      call. If the round was forced, its key joins `_forced_topics_spent`;
      hands off to `_advance_round(result.get("next_question"),
-     result.get("next_question_target"))`.
+     result.get("next_question_target"))` **before** awaiting any of the
+     three bookkeeping tasks started above — see below.
+
+**Bookkeeping writes deferred past the TTS queue.** `record_round_answer`/
+`close_round`/`apply_field_completeness` don't affect what the next question
+says, only session-state persistence, so none of them need to complete
+before the next question/probe is queued for TTS. Each is started via
+`asyncio.shield(...)` (which schedules the underlying CRUD call to run
+immediately) but the `await` on that shield is deferred until *after* the
+call that queues the next `TTSSpeakFrame` (`_probe_round`, or
+`_advance_round` → `_open_round`) — so the write runs concurrently with, not
+serialized before, the speak. They're still awaited (not truly fire-and-
+forgotten) before `_finish_answer` returns, preserving the original
+cancellation/error-propagation behavior (a real exception still bubbles to
+`_run_after_silence`'s `except Exception: logger.exception(...)`).
 5. `except asyncio.CancelledError` (candidate resumed speaking mid-grading):
    if the answer wasn't graded yet, restores `_awaiting_answer` and
    prepends the original `answer_text` back onto `self._buffer` (ahead of
@@ -418,6 +438,17 @@ Three things the director owns beyond the round machinery above:
   rejoins in that window.
 
 ## Last synced
+2026-09-05 (yet later still — latency fix: `_finish_answer` now starts
+`record_round_answer`/`close_round`/`apply_field_completeness` as shielded
+tasks but defers awaiting them until after the next question/probe's
+`TTSSpeakFrame` is queued, and drops a redundant `get_session` re-fetch in
+favor of reusing the row already fetched earlier in the same turn (safe
+since nothing else touches `questions.rounds`/`field_completeness`
+concurrently in that window). `_advance_round`'s own `get_session` at its
+start is unchanged/kept — Task A's fire-and-forget extraction genuinely can
+mutate `resume_data` concurrently, so that one still needs a fresh read.
+See [backend/llm-providers.md](llm-providers.md) for the paired
+`reasoning.effort` change from the same latency investigation.)
 2026-09-05 (later still — round 3 (part 1): a live run showed one
 experience item getting four separate rounds, one per remaining open field
 (`location`, then `projects`, then `achievements`, then `awards`), because

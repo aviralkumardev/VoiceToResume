@@ -84,6 +84,7 @@ class ResumeRoomCRUD(Protocol):
         forced_topic: Optional[str] = None,
         max_questions: Optional[int] = None,
         target: Optional[Dict[str, Any]] = None,
+        turn_latency_seconds: Optional[float] = None,
     ) -> Optional[str]:
         """Opens a brand-new question round: creates
         questions.rounds[round_id] with a single {"question", "answer": None,
@@ -102,20 +103,42 @@ class ResumeRoomCRUD(Protocol):
         topic; `None` for the multi-block opening question. Stored verbatim
         on the round so a later UNABLE_TO_ANSWER grade can be committed back
         into field_completeness precisely (see
-        `completeness_status.build_unable_to_answer_patch`)."""
+        `completeness_status.build_unable_to_answer_patch`). `turn_latency_seconds`,
+        when given, is stored verbatim on this exchange as `latency_seconds`
+        -- the caller's own `time.monotonic()`-measured elapsed seconds since
+        the previous answer was recorded, i.e. real "answer -> next question
+        asked" latency, computed directly rather than left for a reader to
+        derive from `asked_at`/`answered_at`. `None` for the opening question
+        / idle recovery, which have no preceding graded answer."""
         ...
 
-    async def append_round_question(self, session_id: str, round_id: str, question_text: str) -> None:
+    async def append_round_question(
+        self,
+        session_id: str,
+        round_id: str,
+        question_text: str,
+        *,
+        turn_latency_seconds: Optional[float] = None,
+    ) -> None:
         """Appends one more {"question", "answer": None, ...} exchange to an
         already-open round (a probe on the same topic), and sets
         current_round_id/awaiting_answer the same way start_round does.
-        No-op if the round or session doesn't exist."""
+        `turn_latency_seconds` -- see `start_round`'s docstring; same
+        measurement, stored on this probe exchange instead of a round's first
+        one. No-op if the round or session doesn't exist."""
         ...
 
-    async def record_round_answer(self, session_id: str, round_id: str, answer_text: str) -> None:
+    async def record_round_answer(
+        self, session_id: str, round_id: str, answer_text: str, *, answered_at: Optional[str] = None,
+    ) -> None:
         """Fills in answer/answered_at on the round's most recent exchange
-        whose answer is still None, and clears awaiting_answer. No-op if the
-        round or session doesn't exist."""
+        whose answer is still None, and clears awaiting_answer. `answered_at`
+        should be the moment the candidate's answer was finalized (silence
+        debounce elapsed, right before grading started) -- NOT when this
+        method happens to be called, since callers commonly defer this write
+        until after a grading LLM call has already returned. Defaults to
+        now() only if the caller has no better timestamp. No-op if the round
+        or session doesn't exist."""
         ...
 
     async def close_round(

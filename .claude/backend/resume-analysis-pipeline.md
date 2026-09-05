@@ -116,10 +116,13 @@ session ends to clean up anything left ambiguous.
   win on any disagreement. Fail-soft: `_empty_result()` on an empty
   `answer_text` or a provider/schema error defaults to `answer_grade=PARTIAL`,
   everything else `None`/`False` — "nothing usable" always means "still
-  open," never "done." Reuses
-  `settings.resume_room_completeness_provider`/`_model`/`_max_tokens`
-  (same provider cache pattern as `completeness_chain.py`) — no new
-  provider settings.
+  open," never "done." Uses its own settings, separate from
+  `completeness_chain.py` —
+  `resume_room_question_provider` (default `"openai"`),
+  `resume_room_question_model`, `resume_room_question_max_tokens`,
+  `resume_room_question_reasoning_effort` — routed through `OpenAIProvider`
+  by default, not `OpenRouterProvider`; see
+  [backend/llm-providers.md](llm-providers.md).
   Whenever `next_question` is non-null, the response also self-reports
   `next_question_target: {"block", "item_id", "fields"}` (`item_id`
   nullable, `fields` an optional *list* of field names) describing what
@@ -372,6 +375,24 @@ presence-only `field_status.py` module this replaced has been deleted.
   transcript at once.
 
 ## Last synced
+2026-09-05 (yet later still — trimmed `SYSTEM_PROMPT`/
+`TOPIC_QUESTION_SYSTEM_PROMPT` in `question_prompts.py` for latency:
+restructured with Markdown section headers (`# Identity`, `# Step 1:
+meta-question check`, `# Inputs`, `# Step 2: grade + draft the next two
+questions`) per OpenAI's reasoning-model prompting guidance (keep prompts
+direct, avoid hedging/redundant prose, use delimiters for section clarity)
+— every substantive behavioral rule (meta-question grounding, block/field
+collision, name-the-specific-item, consolidate-don't-drip-feed, the
+three-way `answer_grade` semantics, always-draft-both-follow-ups,
+`next_question_target` shape) is unchanged, only wording was cut. Verified
+against representative live calls (multi-field consolidation, specific-item
+naming) with no behavioral regression. Also corrected this file's stale
+claim that `run_question_chain` reuses `resume_room_completeness_*`
+settings — it's used `resume_room_question_*` via `OpenAIProvider` since
+the OpenAI-provider switch earlier the same day; see
+[backend/llm-providers.md](llm-providers.md) for the accompanying
+prompt-caching fix in `OpenAIProvider` itself, which is what these prompts'
+now-stable Markdown-header prefix is designed to be cached by.)
 2026-09-05 (later still — round 3 (part 1) of live-session bug fixes: a
 session showed one experience item getting FOUR separate rounds, each
 asking about exactly one of its remaining open fields (`location`,

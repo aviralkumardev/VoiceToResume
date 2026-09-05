@@ -115,11 +115,10 @@ as a typed setting read from `.env`.
   `run_topic_question_chain`) now have their **own** settings —
   `resume_room_question_provider` (default `"openai"`),
   `resume_room_question_model` (default `"gpt-5.6-terra"`),
-  `resume_room_question_max_tokens` (default `3000`) — rather than reusing
-  `resume_room_completeness_provider`/`_model`/`_max_tokens` the way
-  `run_answer_evaluation_chain` (now deleted) used to. `OpenAIProvider` sends
-  no `reasoning.effort` (left at the model's own default) — there's no
-  `resume_room_question_reasoning_effort` setting. This is the one place
+  `resume_room_question_max_tokens` (default `3000`),
+  `resume_room_question_reasoning_effort` (default `"none"`) — rather than
+  reusing `resume_room_completeness_provider`/`_model`/`_max_tokens` the way
+  `run_answer_evaluation_chain` (now deleted) used to. This is the one place
   in the interview pipeline that talks to OpenAI directly instead of through
   OpenRouter; see [backend/llm-providers.md](llm-providers.md)'s
   `OpenAIProvider` section and
@@ -131,6 +130,17 @@ as a typed setting read from `.env`.
   this ever needs a second allowed origin.
 
 ## Last synced
+2026-09-05 (yet later still — corrected `resume_room_question_reasoning_effort`'s
+default here to `"none"` (matching `config.py`'s actual current value, not
+the `"low"` this doc previously claimed) and noted `question_prompts.py`'s
+system prompts were trimmed for latency, and `OpenAIProvider` gained an
+explicit prompt-cache breakpoint — see
+[backend/llm-providers.md](llm-providers.md) and
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md).)
+2026-09-05 (yet later still — reinstated `resume_room_question_reasoning_effort`
+(default `"low"`), sent as `reasoning.effort` on every `OpenAIProvider`
+request. See [backend/llm-providers.md](llm-providers.md) for the latency
+investigation that led to this and its (inconclusive) measurement result.)
 2026-09-05 (later still — added `resume_room_question_provider` (default
 `"openai"`), `resume_room_question_model` (default `"gpt-5.6-terra"`),
 `resume_room_question_max_tokens` (default `3000`). `question_chain.py` no

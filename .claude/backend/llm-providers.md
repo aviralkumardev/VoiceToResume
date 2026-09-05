@@ -50,15 +50,40 @@ only on the abstract interface.
     rejection, so there's no temperature-drop-and-retry branch here.
   - **`cost` is always `None`** — OpenAI's own API doesn't report a
     per-call cost figure the way OpenRouter's `usage.cost` extension does.
-  - **No `reasoning.effort` is ever sent** — left at the model's own
-    default rather than configured; there is no
-    `resume_room_question_reasoning_effort` setting.
+  - **`reasoning.effort` is sent on every request**, from
+    `settings.resume_room_question_reasoning_effort` (default `"none"` —
+    corrected from an earlier `"low"`; OpenAI's reasoning guide explicitly
+    recommends `none` for "voice, fast information retrieval, and
+    classification" tasks, an even stronger match for this per-answer
+    grading task than `low`). An earlier live A/B of `low` vs. unset showed
+    no measurable latency difference for this task's prompt shape (~1.9s
+    avg either way, `reasoning_tokens` near-zero/`None` in both) — `none`
+    vs `low` hasn't been separately re-measured, but costs nothing to keep
+    at the OpenAI-recommended value.
   - `store: False` is always sent on every request — interview
     transcripts/resume data are candidate PII, so responses aren't retained
     server-side beyond what's needed to serve them.
-  - `supports_prompt_caching = True`, but unlike OpenRouter's explicit
-    per-message `prompt_cache_breakpoint` marker, Responses API caching is
-    automatic prefix-matching — nothing to mark per call.
+  - **`supports_prompt_caching = True`, via an explicit cache breakpoint —
+    NOT automatic prefix-matching.** `_build_request_kwargs` marks the
+    first message's content as an `input_text` content block with
+    `prompt_cache_breakpoint: {"mode": "explicit"}` whenever that message's
+    role is `"system"`/`"developer"`, and sets `prompt_cache_options:
+    {"mode": "explicit"}` plus a `prompt_cache_key` derived by hashing that
+    message's own text (`_prompt_cache_key_for`, sha256-truncated, prefixed
+    `question_chain_`) at the request's top level. This was a deliberate
+    fix, not the original design: GPT-5.6+'s *implicit*-only caching places
+    its one breakpoint at the end of the **latest** eligible message, which
+    for `question_chain.py`'s calls is always the dynamic per-call user
+    payload (resume/history/coverage), never the stable system prompt — so
+    under implicit-only caching the ~1,750-token system prompt was being
+    fully reprocessed on every single call, caching nothing. Explicit
+    breakpoints fix this because they mark a specific message boundary
+    rather than "whatever's last." Live-verified: two back-to-back calls
+    with the same system prompt showed `cached_tokens: 0` then
+    `cached_tokens: 1659` (of 1817 prompt tokens) on the second call. A
+    message whose `content` isn't a plain string (already a content-block
+    list) is left untouched — this only special-cases the common single-
+    string-system-message shape both chains in `question_chain.py` use.
   - Usage field names differ at the SDK level: `usage.input_tokens`/
     `output_tokens`/`total_tokens` (+ `input_tokens_details.cached_tokens`,
     `output_tokens_details.reasoning_tokens`) rather than Chat Completions'
@@ -108,11 +133,10 @@ only on the abstract interface.
   [backend/app-config.md](app-config.md).
 - `OpenAIProvider` wraps the same `openai` Python SDK with no `base_url`
   override (hits `api.openai.com` directly). Reads `settings.openai_api_key`,
-  `resume_room_question_model`, `llm_request_timeout_seconds`,
-  `max_json_repair_retries`, `max_rate_limit_retries`,
-  `rate_limit_backoff_base_seconds` — no `default_temperature` (never sends
-  one), no `reasoning.effort` (left at the model default — no
-  `resume_room_question_reasoning_effort` setting), and no
+  `resume_room_question_model`, `resume_room_question_reasoning_effort`,
+  `llm_request_timeout_seconds`, `max_json_repair_retries`,
+  `max_rate_limit_retries`, `rate_limit_backoff_base_seconds` — no
+  `default_temperature` (never sends one), and no
   `system_prompt_caching_enabled` (Responses API caching is automatic, not
   opt-in per call).
 - `openai_sdk_errors.py`'s `translate_openai_sdk_error` is the single place
@@ -172,6 +196,22 @@ only on the abstract interface.
   is automatic prefix-matching, not something a per-call flag turns on.
 
 ## Last synced
+2026-09-05 (yet later still — fixed prompt caching for `OpenAIProvider`:
+added an explicit `prompt_cache_breakpoint` on the first system/developer
+message plus `prompt_cache_options`/`prompt_cache_key` (hash-derived from
+that message's text) in `_build_request_kwargs`, since GPT-5.6+'s implicit-
+only caching was never actually caching this provider's stable system
+prompt — see the `OpenAIProvider` bullet above for the mechanism and the
+live-measured before/after. Also corrected
+`resume_room_question_reasoning_effort`'s documented default from `"low"`
+to `"none"`, matching `config.py`'s actual current value — `none` is
+OpenAI's own recommended effort for voice/classification-shaped tasks like
+this one.)
+2026-09-05 (yet later still — reinstated `reasoning.effort` on
+`OpenAIProvider` as a real setting, `resume_room_question_reasoning_effort`
+(default `"low"`), after a latency investigation. Live A/B measurement
+against this task's actual prompt shape found no measurable latency
+difference vs. leaving it unset — see the `OpenAIProvider` bullet above.)
 2026-09-05 (later still — dropped `reasoning.effort` from `OpenAIProvider`
 entirely; it never sets `reasoning` on the request now, and there's no
 `resume_room_question_reasoning_effort` setting.)

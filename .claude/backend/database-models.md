@@ -42,30 +42,37 @@ only (no real database yet).
   it served). Committed unconditionally the instant it's called — the
   caller (`silence_completeness_worker`, or the post-extraction-batch
   trigger) is responsible for only calling this once a result is final.
-- **`start_round(session_id, *, question_text, forced_topic=None, max_questions=None, target=None) -> Optional[str]`**
+- **`start_round(session_id, *, question_text, forced_topic=None, max_questions=None, target=None, turn_latency_seconds=None) -> Optional[str]`**
   — opens a new round: creates `questions["rounds"][round_id]` with one
   exchange (`{"question": question_text, "answer": None, "asked_at": ...,
-  "answered_at": None}`), appends `round_id` to `round_order`, sets
-  `current_round_id`/`awaiting_answer=True`, and returns the new
-  `round_id`. `max_questions` defaults to
+  "answered_at": None, "latency_seconds": turn_latency_seconds}`), appends
+  `round_id` to `round_order`, sets `current_round_id`/`awaiting_answer=True`,
+  and returns the new `round_id`. `max_questions` defaults to
   `settings.resume_room_max_questions_per_round`, stamped once at creation.
   `target` is `{"block", "item_id", "fields"}` (`item_id` nullable, `fields`
   an optional list of field names) describing what this round's question is
   about — stored verbatim as
   `rounds[round_id]["target"]`, see the round shape below and
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for how it's built and
-  later used.
-- **`append_round_question(session_id, round_id, question_text) -> None`**
+  later used. `turn_latency_seconds` is the caller's own
+  `time.monotonic()`-measured elapsed seconds since the previous answer was
+  recorded — see the latency gotcha below; `None` for the opening question /
+  idle recovery, which have no preceding graded answer.
+- **`append_round_question(session_id, round_id, question_text, *, turn_latency_seconds=None) -> None`**
   — appends one more exchange (a probe) to an already-open round, without
-  touching `forced_topic` or `current_round_id`.
-- **`record_round_answer(session_id, round_id, answer_text) -> None`** —
+  touching `forced_topic` or `current_round_id`. `turn_latency_seconds` — same
+  as `start_round`'s, landing on this probe exchange instead.
+- **`record_round_answer(session_id, round_id, answer_text, *, answered_at=None) -> None`** —
   fills `answer`/`answered_at` on the round's **most recent exchange whose
   answer is still `None`** (walks `exchanges` in reverse), and clears
   `awaiting_answer`. Load-bearing distinction from the old per-target
   message log: an exchange is a fixed one-shot `{question, answer}` slot,
   not an append-only list, so a caller must never fill this slot with
   anything other than the real answer to that exact question (see the
-  meta-question gotcha below).
+  meta-question gotcha below). `answered_at` should be the moment the
+  answer was *finalized* (silence debounce elapsed, right before grading
+  started), not whenever this method happens to actually run — see the
+  gotcha below; falls back to `now()` only if the caller passes nothing.
 - **`close_round(session_id, round_id, *, grade, llm_usage=None) -> None`**
   — sets `status="closed"`, stamps `grade`/`closed_at`, folds `llm_usage`,
   and clears `current_round_id`/`awaiting_answer` if this was the active
@@ -92,7 +99,10 @@ only (no real database yet).
       "target": Optional[dict],      # {"block", "item_id", "fields"} -- what this round is about, or None
       "max_questions": int,          # stamped at open, from resume_room_max_questions_per_round
       "exchanges": [
-          {"question": str, "answer": Optional[str], "asked_at": iso, "answered_at": Optional[iso]},
+          {
+              "question": str, "answer": Optional[str], "asked_at": iso, "answered_at": Optional[iso],
+              "latency_seconds": Optional[float],  # see the latency gotcha below
+          },
           ...
       ],
       "opened_at": iso, "closed_at": Optional[iso],
@@ -152,8 +162,56 @@ only (no real database yet).
   raised — a broken debug export must never break the session.
 - `mark_finished` is a no-op if the session is already non-active — a
   session's terminal status is set exactly once.
+- **`answered_at`/`asked_at` are meant to be read as a turn-latency
+  measure**, not just a record of "answer happened." `InterviewDirector._finish_answer`
+  (see [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)) captures
+  `answered_at` at the top of the method — right after the silence debounce
+  elapsed, before the grading LLM call — and passes it into
+  `record_round_answer` explicitly, even though that call is itself deferred
+  until after grading returns (the write is off the critical path; the
+  timestamp it carries is not). Do not let a future caller pass `None`/omit
+  `answered_at` and let this method stamp `now()` at write-time instead —
+  that would fold the grading call's own latency into `answered_at`, making
+  `next_exchange.asked_at - this_exchange.answered_at` measure nothing
+  (this was a real bug, fixed 2026-09-05).
+- **`latency_seconds` on an exchange is the turn-latency number itself —
+  no timestamp arithmetic required.** Superseding the `asked_at`/`answered_at`
+  subtraction described above: `InterviewDirector` now measures the actual
+  "candidate finished answering → next question asked by TTS" gap directly
+  with `time.monotonic()` (captured as `turn_started` at the top of
+  `_finish_answer`, before the grading call) and passes the elapsed seconds
+  straight into `start_round`/`append_round_question` as
+  `turn_latency_seconds`, landing on the exchange that opens as
+  `latency_seconds`. This is the number to read for "how long did this turn
+  take" — `asked_at`/`answered_at` remain correct (see above) and still work
+  for cross-checking, but `latency_seconds` is direct and doesn't require
+  parsing ISO timestamps or subtracting across two different exchanges.
+  `None` on the opening question / idle-recovery exchanges, which have no
+  preceding graded answer to measure from. See
+  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for exactly where each
+  branch (organic next-question, forced conflict/unresolved topic,
+  required-gap safety net, same-round probe) captures and forwards it —
+  every branch's own extra work (LLM wording calls, `_await_task_a_settle`'s
+  bounded wait) is included, since the candidate is genuinely waiting through
+  all of it.
 
 ## Last synced
+2026-09-05 (yet later still — added `turn_latency_seconds` to
+`start_round`/`append_round_question`, stored on the opened/appended exchange
+as `latency_seconds`: a direct `time.monotonic()`-measured turn-latency
+number in seconds, superseding the `asked_at`/`answered_at`-subtraction
+approach from the immediately preceding change — the user asked for a
+seconds value, not timestamps to subtract. See the new gotcha above and
+[backend/stt-tts-pipeline.md](stt-tts-pipeline.md).)
+2026-09-05 (later still — `record_round_answer` gained an optional
+`answered_at` kwarg; `InterviewDirector._finish_answer` now captures the
+timestamp right after the silence debounce elapses and passes it through,
+instead of letting the deferred write stamp `now()` after the grading LLM
+call had already returned. Fixes `answered_at` so it reflects "candidate
+finished speaking," not "grading finished" — needed to make
+`next_exchange.asked_at - this_exchange.answered_at` a valid turn-latency
+measurement. See the new gotcha above and
+[backend/stt-tts-pipeline.md](stt-tts-pipeline.md).)
 2026-09-05 (replaced the per-target `threads`/`settled_paths`/
 `pending_claims`/`reopened` question ledger with a flat, round-based one:
 `questions.rounds[round_id]` holds a sequence of fixed `{question, answer}`

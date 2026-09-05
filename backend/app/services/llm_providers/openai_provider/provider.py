@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import replace
 from typing import Any, Optional, Sequence
@@ -29,7 +30,11 @@ class OpenAIProvider(LLMProvider):
     every OpenRouterProvider behavior: no `temperature` is ever sent (current
     OpenAI guidance for reasoning-tier models is to omit it rather than
     send-then-retry-on-rejection), and `cost` is always `None` since OpenAI's
-    own API doesn't report a per-call cost figure the way OpenRouter does."""
+    own API doesn't report a per-call cost figure the way OpenRouter does.
+    Sends a fixed `reasoning.effort` (default `"low"`, from
+    `settings.resume_room_question_reasoning_effort`) — OpenAI's own guidance
+    recommends `low` for grading/classification/rewrite-shaped tasks like
+    this one; the model's own default (`medium`) costs real latency here."""
 
     provider_name = "openai"
 
@@ -40,10 +45,16 @@ class OpenAIProvider(LLMProvider):
         async_client: Optional[AsyncOpenAI] = None,
         model: Optional[str] = None,
         timeout: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         self._settings = settings or global_settings
         self.model = model or self._settings.resume_room_question_model
         self.timeout = timeout or self._settings.llm_request_timeout_seconds
+        self.reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else self._settings.resume_room_question_reasoning_effort
+        )
 
         self._async_client = async_client or AsyncOpenAI(
             api_key=self._settings.openai_api_key,
@@ -53,9 +64,8 @@ class OpenAIProvider(LLMProvider):
 
     @property
     def supports_prompt_caching(self) -> bool:
-        """PromptCaching protocol: the Responses API caches automatically by
-        prompt prefix — there's no explicit per-message cache breakpoint to
-        set the way OpenRouterProvider marks one."""
+        """PromptCaching protocol: the first (system) message is marked with
+        an explicit `prompt_cache_breakpoint` — see `_build_request_kwargs`."""
         return True
 
     async def generate_response(
@@ -188,18 +198,65 @@ class OpenAIProvider(LLMProvider):
         messages: Sequence[LLMMessage],
         options: LLMRequestOptions,
     ) -> dict[str, Any]:
-        """Assemble the keyword arguments for a Responses API call."""
+        """Assemble the keyword arguments for a Responses API call.
+
+        The first message, when it's a system/developer prompt, is marked
+        with an explicit `prompt_cache_breakpoint` rather than relying on
+        implicit caching: for these single-turn calls the user message (the
+        dynamic resume/history/coverage payload) changes on every call, so
+        implicit caching's one breakpoint — placed at the end of the latest
+        eligible message — would land on that ever-changing payload and
+        never actually cache the stable system prompt. An explicit
+        breakpoint after the system prompt, keyed by a hash of its content,
+        caches that stable prefix instead."""
+        dict_messages: list[dict[str, Any]] = []
+        cache_key_source: Optional[str] = None
+        for message_index, message in enumerate(messages):
+            if (
+                message_index == 0
+                and message.role in ("system", "developer")
+                and isinstance(message.content, str)
+            ):
+                dict_messages.append(
+                    {
+                        "role": message.role,
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": message.content,
+                                "prompt_cache_breakpoint": {"mode": "explicit"},
+                            }
+                        ],
+                    }
+                )
+                cache_key_source = message.content
+            else:
+                dict_messages.append(self._convert_message_to_dict(message))
+
         request_kwargs: dict[str, Any] = {
             "model": self.model,
-            "input": [self._convert_message_to_dict(message) for message in messages],
+            "input": dict_messages,
             "max_output_tokens": options.max_output_tokens,
             # Interview transcripts/resume data are candidate PII — don't
             # retain responses server-side beyond what's needed to serve them.
             "store": False,
         }
+        if cache_key_source is not None:
+            request_kwargs["prompt_cache_options"] = {"mode": "explicit"}
+            request_kwargs["prompt_cache_key"] = self._prompt_cache_key_for(cache_key_source)
+        if self.reasoning_effort:
+            request_kwargs["reasoning"] = {"effort": self.reasoning_effort}
         if options.metadata:
             request_kwargs["metadata"] = options.metadata
         return request_kwargs
+
+    @staticmethod
+    def _prompt_cache_key_for(system_prompt_text: str) -> str:
+        """Derive a stable cache key from the system prompt's own content, so
+        each distinct system prompt (per call site) gets its own cache
+        lineage without requiring a call site to pass one explicitly."""
+        digest = hashlib.sha256(system_prompt_text.encode("utf-8")).hexdigest()[:16]
+        return f"question_chain_{digest}"
 
     def _convert_message_to_dict(self, message: LLMMessage) -> dict[str, Any]:
         return {"role": message.role, "content": message.content}
