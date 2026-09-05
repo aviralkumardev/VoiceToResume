@@ -1,0 +1,35 @@
+{
+  "personal": {
+    "name": null,
+    "email": null,
+    "phone": null,
+    "location": null,
+    "linkedin": null,
+    "github": null,
+    "portfolio": null
+  },
+
+  "summary": null,
+
+  "experience": [],
+
+  "education": [],
+
+  "skills": [],
+
+  "projects": [],
+
+  "achievements": [],
+
+  "awards": [],
+
+  "courses": [],
+
+  "certifications": [],
+
+  "languages": [],
+
+  "additional_information": [],
+
+  "preferences": {}
+}

@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --orb: clamp(96px, 16vh, 170px);
+}
+
+@keyframes orb-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.035);
+  }
+}
+
+.agent-orb {
+  position: relative;
+  height: var(--orb);
+  width: var(--orb);
+  display: grid;
+  place-items: center;
+}
+
+.agent-orb__canvas {
+  position: absolute;
+  height: 190%;
+  width: 190%;
+  pointer-events: none;
+}
+
+.agent-orb__fallback {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: linear-gradient(215deg, #f0e6ff 0%, #b95cf0 26%, #6b3bf2 54%, #2560f2 78%, #14a8ef 100%);
+  box-shadow: 0 0 24px rgba(96, 78, 240, 0.35);
+  animation: orb-breathe 5.5s ease-in-out infinite;
+}

@@ -1,0 +1,247 @@
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.core.config import settings
+import app.services.llm_providers.openai_provider
+import app.services.llm_providers.openrouter_provider
+from app.services.llm_providers.data_models import LLMMessage, LLMRequestOptions, LLMResponse
+from app.services.llm_providers.json_schema_validation import SchemaSpec
+from app.services.llm_providers.provider_exceptions import LLMProviderError, LLMSchemaValidationError
+from app.services.llm_providers.provider_factory import LLMProviderFactory
+from app.services.llm_providers.provider_interface import LLMProvider
+
+from app.meeting_room.resume_analysis_pipeline.question_prompts import (
+    SYSTEM_PROMPT,
+    TOPIC_QUESTION_SYSTEM_PROMPT,
+    build_question_user_prompt,
+    build_topic_question_user_prompt,
+)
+
+
+ANSWER_GRADE_PARTIAL = "PARTIAL"
+ANSWER_GRADE_SUFFICIENT = "SUFFICIENT"
+ANSWER_GRADE_UNABLE_TO_ANSWER = "UNABLE_TO_ANSWER"
+
+# Terminal for a ROUND, not to be confused with completeness_status's
+# TERMINAL_STATUSES (which also includes NOT_APPLICABLE, a concept that has
+# no meaning for a single graded answer).
+TERMINAL_GRADES = frozenset({ANSWER_GRADE_SUFFICIENT, ANSWER_GRADE_UNABLE_TO_ANSWER})
+
+
+QUESTION_RESPONSE_SCHEMA = SchemaSpec.from_dict(
+    {
+        "type": "object",
+        "properties": {
+            "is_meta_question": {"type": "boolean"},
+            "meta_response": {"type": ["string", "null"]},
+            "answer_grade": {"type": "string"},
+            "reason": {"type": ["string", "null"]},
+            "probe_question": {"type": ["string", "null"]},
+            "next_question": {"type": ["string", "null"]},
+            "next_question_target": {
+                "type": ["object", "null"],
+                "properties": {
+                    "block": {"type": "string"},
+                    "item_id": {"type": ["string", "null"]},
+                    "fields": {"type": ["array", "null"], "items": {"type": "string"}},
+                },
+            },
+        },
+        "required": ["answer_grade"],
+    },
+    name="question_chain_result",
+    strict=False,
+)
+
+TOPIC_QUESTION_RESPONSE_SCHEMA = SchemaSpec.from_dict(
+    {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string"},
+        },
+        "required": ["question"],
+    },
+    name="topic_question_result",
+    strict=False,
+)
+
+
+_provider_cache: Dict[Tuple[str, str], LLMProvider] = {}
+
+
+def _get_provider() -> LLMProvider:
+    cache_key = (
+        settings.resume_room_question_provider,
+        settings.resume_room_question_model,
+    )
+    if cache_key not in _provider_cache:
+        _provider_cache[cache_key] = LLMProviderFactory.create(cache_key[0], model=cache_key[1])
+    return _provider_cache[cache_key]
+
+
+def _usage_dict(response: LLMResponse) -> Dict[str, Any]:
+    return {
+        "model": response.model,
+        "prompt_tokens": response.prompt_tokens,
+        "completion_tokens": response.completion_tokens,
+        "total_tokens": response.total_tokens,
+        "cost": response.cost,
+    }
+
+
+def _empty_result(llm_usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "is_meta_question": False,
+        "meta_response": None,
+        "answer_grade": ANSWER_GRADE_PARTIAL,
+        "reason": None,
+        "probe_question": None,
+        "next_question": None,
+        "next_question_target": None,
+        "_llm_usage": llm_usage,
+    }
+
+
+async def run_question_chain(
+    resume: Dict[str, Any],
+    coverage: Dict[str, Any],
+    conversation_history: List[Dict[str, Any]],
+    answer_text: str,
+    field_completeness: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The ONE LLM call per answer turn: grades the last answer in
+    `conversation_history` AND, in the same response, drafts both the probe
+    (if it stays open) and the next question (if it resolves) -- no target
+    selection, no shortlist, no menu the LLM must pick from. It reasons
+    freely over the whole `resume`/`coverage` to decide what matters most to
+    ask about next. `coverage` must already have any not_applicable blocks
+    filtered out by the caller (see `askable_coverage_schema` in
+    `coverage_schema.py`) -- this chain has no filtering of its own.
+    `field_completeness`, if given, grounds `probe_question`/`next_question`
+    in the actual per-field/per-item verdicts already computed for this
+    session, so a probe targets exactly what's still open instead of
+    re-asking for something already captured.
+
+    Whenever `next_question` is non-null, the response also self-reports
+    `next_question_target: {"block", "item_id", "fields"}` (`item_id`
+    optional, `fields` an optional list) describing what that
+    freshly-drafted question is about -- not a menu Python hands it,
+    metadata about its own choice. `fields` is plural because the prompt
+    requires the model to consolidate every currently-open field of a
+    targeted item/block into ONE question rather than drip-feeding them
+    across separate rounds (see `question_prompts.SYSTEM_PROMPT`'s
+    "consolidate, don't drip-feed" rule) -- so a single question can name
+    several fields at once (e.g. an experience item's `location`,
+    `projects`, `achievements`, `awards` all in one ask). The caller
+    (`InterviewDirector`) sanitizes this before trusting it and stores it on
+    the round it opens, both to keep the wording precise about which item/
+    field-vs-block concept a question means, and so a later `UNABLE_TO_ANSWER`
+    grade can be committed back into `field_completeness` for every field the
+    question covered (`completeness_status.build_unable_to_answer_patch`) --
+    the one verdict the batched grader can never infer from `resume_data`
+    alone.
+
+    Fail-soft: any provider/schema error returns `_empty_result()`, whose
+    `answer_grade` is PARTIAL -- "nothing usable" means "still open", never
+    "done", same convention every other chain in this pipeline uses.
+    """
+    if not answer_text.strip():
+        return _empty_result()
+
+    provider = _get_provider()
+    messages = [
+        LLMMessage(role="system", content=SYSTEM_PROMPT),
+        LLMMessage(
+            role="user",
+            content=build_question_user_prompt(
+                resume, coverage, conversation_history, answer_text, field_completeness
+            ),
+        ),
+    ]
+    options = LLMRequestOptions(max_output_tokens=settings.resume_room_question_max_tokens)
+
+    try:
+        parsed, response = await provider.generate_json(messages, QUESTION_RESPONSE_SCHEMA, options)
+    except LLMSchemaValidationError as exc:
+        return _empty_result(_usage_dict(exc.last_response) if exc.last_response else None)
+    except LLMProviderError:
+        return _empty_result()
+
+    parsed.setdefault("is_meta_question", False)
+    parsed.setdefault("meta_response", None)
+    parsed.setdefault("reason", None)
+    parsed.setdefault("probe_question", None)
+    parsed.setdefault("next_question", None)
+    parsed.setdefault("next_question_target", None)
+    if not parsed.get("next_question"):
+        parsed["next_question_target"] = None
+    elif not isinstance(parsed.get("next_question_target"), dict):
+        parsed["next_question_target"] = None
+    else:
+        target = parsed["next_question_target"]
+        raw_fields = target.get("fields")
+        if isinstance(raw_fields, list):
+            fields = [f for f in raw_fields if isinstance(f, str)]
+            target["fields"] = fields or None
+        else:
+            target["fields"] = None
+    if parsed.get("answer_grade") not in (
+        ANSWER_GRADE_PARTIAL, ANSWER_GRADE_SUFFICIENT, ANSWER_GRADE_UNABLE_TO_ANSWER,
+    ):
+        parsed["answer_grade"] = ANSWER_GRADE_PARTIAL
+
+    parsed["_llm_usage"] = _usage_dict(response)
+    return parsed
+
+
+def _topic_fallback_question(topic_description: str) -> Dict[str, Any]:
+    return {
+        "question": f"Let's cover one more thing -- could you tell me about {topic_description}?",
+        "_llm_usage": None,
+    }
+
+
+async def run_topic_question_chain(
+    resume: Dict[str, Any],
+    coverage: Dict[str, Any],
+    conversation_history: List[Dict[str, Any]],
+    topic_description: str,
+    field_completeness: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Words ONE natural spoken question for a topic Python has already
+    decided must be asked -- a forced conflict/unresolved record, or a
+    required-coverage gap the safety net caught. Shared by both callers so
+    there is one LLM-wording chain for every forced/gap question, not three.
+
+    Fail-soft: on provider/schema error, falls back to one minimal
+    Python-built sentence from `topic_description` -- the only non-LLM
+    question wording left anywhere in the interview loop.
+    """
+    if not topic_description.strip():
+        return _topic_fallback_question("that")
+
+    provider = _get_provider()
+    messages = [
+        LLMMessage(role="system", content=TOPIC_QUESTION_SYSTEM_PROMPT),
+        LLMMessage(
+            role="user",
+            content=build_topic_question_user_prompt(
+                resume, coverage, conversation_history, topic_description, field_completeness
+            ),
+        ),
+    ]
+    options = LLMRequestOptions(max_output_tokens=settings.resume_room_question_max_tokens)
+
+    try:
+        parsed, response = await provider.generate_json(
+            messages, TOPIC_QUESTION_RESPONSE_SCHEMA, options
+        )
+    except LLMSchemaValidationError:
+        return _topic_fallback_question(topic_description)
+    except LLMProviderError:
+        return _topic_fallback_question(topic_description)
+
+    if not isinstance(parsed.get("question"), str) or not parsed["question"].strip():
+        return _topic_fallback_question(topic_description)
+
+    parsed["_llm_usage"] = _usage_dict(response)
+    return parsed

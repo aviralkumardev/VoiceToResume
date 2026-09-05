@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+pydantic-settings
+python-dotenv
+openai
+jsonschema
+httpx
+pipecat-ai[daily,openai,sarvam,silero]
