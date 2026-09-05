@@ -4,16 +4,15 @@
 Runs the actual live voice bot inside a Daily room: speech-to-text →
 `InterviewDirector` (round-based Q&A, no chat LLM in the loop) → text-to-
 speech, plus bridging every user-facing event (live captions, speaking
-indicator, agent-ready signal) to the frontend as Daily app messages. Also
-the source of the candidate's raw VAD speaking state, forwarded to the
-orchestrator for the silence-triggered completeness pipeline. Built on
-pipecat's `Pipeline`/`PipelineWorker`.
+indicator, agent-ready signal) to the frontend as Daily app messages. Built
+on pipecat's `Pipeline`/`PipelineWorker`.
 
 **There is no persona/chat LLM anywhere in this pipeline.** Every word the
 bot ever says is either the fixed opening/closing line or a question worded
 by one of the LLM chains in
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) —
-`question_chain.run_question_chain`/`run_topic_question_chain` — all
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) — the
+combined analysis call words every queued question ahead of time,
+`question_chain.run_answer_grading_chain` words same-round probes — all
 delivered as literal TTS text (`TTSSpeakFrame`), never generated live by a
 chat model reacting to the candidate.
 
@@ -31,8 +30,7 @@ chat model reacting to the candidate.
   `FrameProcessor`s that emit app messages to the frontend).
 - `backend/app/meeting_room/stt_tts_pipeline/interview_director.py` —
   `InterviewDirector`, the sole conversational driver for the whole session
-  (see below). Rewritten top-to-bottom (~1500 → ~460 lines) to a
-  round-based design; see "InterviewDirector" below.
+  (see below).
 - `backend/app/meeting_room/stt_tts_pipeline/__init__.py` —
   `select_provider()` helper shared by `stt.py`/`tts.py`.
 
@@ -58,8 +56,8 @@ chat model reacting to the candidate.
   graceful pipeline shutdown. `run_bot` passes it as
   `InterviewDirector(..., on_complete=bot.end_session)`, so
   `_complete_interview` calls it right after queuing the closing
-  `TTSSpeakFrame` (see below) — this is what actually ends the Daily room
-  once the interview genuinely finishes.
+  `TTSSpeakFrame` — this is what actually ends the Daily room once the
+  interview genuinely finishes.
 - `ParticipantTracker` — tracks human participant ids, captures mic audio
   per participant, and schedules pipeline teardown
   (`resume_room_empty_room_grace_seconds` after the room goes empty).
@@ -69,230 +67,192 @@ chat model reacting to the candidate.
   `speaking` (from `SpeakingBridge`), `agent-ready` (from `BotSession.greet`).
 - `UserTranscriptBridge` also takes an `on_speaking_change: Optional[Callable[[bool], None]]`
   constructor param, called `True` on `UserStartedSpeakingFrame` / `False`
-  on `UserStoppedSpeakingFrame` — a same-process callback (no app message
-  emitted for it), separate from the `transcript`/turn-numbering logic.
+  on `UserStoppedSpeakingFrame` — a same-process callback wired straight to
+  `director.on_speaking_change` in `pipeline.py`. There is no second
+  consumer of this signal any more (no batched-worker speaking queue — see
+  [backend/completeness-pipeline.md](completeness-pipeline.md)).
 
-## `InterviewDirector` — round-based Q&A state machine
+## `InterviewDirector` — round-based Q&A, queue-popping state machine
 Constructed in `run_bot` right after the `PipelineWorker` exists (it needs
 `worker` to speak). `on_complete` is wired to `bot.end_session`. Drives the
 entire conversation — there is nothing else that speaks. State is
-per-round rather than per-target: `_current_round_id`/
-`_current_round_forced`/`_current_question_text` describe whichever round
-is currently open (if any); `_awaiting_answer` gates whether
-`record_candidate_text` is buffering an in-progress answer.
+per-round: `_current_round_id`/`_current_round_forced`/
+`_current_question_text` describe whichever round is currently open (if
+any); `_awaiting_answer` gates whether `record_candidate_text` is buffering
+an in-progress answer.
+
+**Target *selection* is entirely the analysis worker's job now, not this
+class's.** `questions.queue` is regenerated wholesale every combined-call
+cycle (conflicts/unresolved first, then ordinary coverage gaps, in
+Python-authoritative priority order — see
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)'s
+`next_target.compute_candidate_queue`), already fully worded. This class
+only ever pops the head of that queue and speaks it — **no LLM call at pop
+time**, and no in-memory bookkeeping of what's been given up on or forced
+(that now lives on the session row, since the analysis worker's task needs
+to see it too — `crud.mark_target_given_up`/`mark_forced_topic_spent`).
 
 **A round is one subject.** It holds one or more `{question, answer}`
 exchanges (the opening question plus any probes) under a per-round question
-budget (`resume_room_max_questions_per_round`, default 2 — counts the
-opening question too). CRUD's `questions.rounds[round_id]` shape and the
-four methods that manage it (`start_round`/`append_round_question`/
-`record_round_answer`/`close_round`) are documented in
+budget (`resume_room_max_questions_per_round`, default 2). CRUD's
+`questions.rounds[round_id]` shape and the methods that manage it
+(`start_round`/`append_round_question`/`record_round_answer`/`close_round`/
+`apply_question_queue`/`pop_question_queue_head`/`mark_target_given_up`/
+`mark_forced_topic_spent`) are documented in
 [backend/database-models.md](database-models.md).
+
+**The opening round is special.** It has no single `target`/`complete_when`
+bar (a multi-block opener), so `_finish_answer` skips grading entirely for
+it and goes straight to flush + advance.
+
+Every other round's answer is graded by ONE narrow LLM call
+(`question_chain.run_answer_grading_chain`) against ONLY that round's own
+`target_complete_when` bar and the conversation history — it never sees the
+whole resume/coverage rubric or a candidate list, since deciding what to
+ask about NEXT is not its job at all.
 
 - **`ask_opening_question(question)`** — called once, from `BotSession.greet()`
   the instant a participant joins: `await self._open_round(question,
   forced=None, target=None)`. The opening answer is graded exactly like any
-  other round by Task B — no special-cased never-reprobe behavior any more;
-  if the candidate's opening answer is thin, Task B may naturally probe it
-  just like any other round. `target=None` since it's a broad multi-block
-  opener, not about one coverage gap.
+  other round — no special-cased never-reprobe behavior.
+- **`record_candidate_text(text)`** — buffers finalized STT chunks into
+  `self._buffer` while `_awaiting_answer`, purely additive — `pipeline.py`'s
+  `persist()` also always sends this same text straight to the transcript/
+  analysis queue live, independent of this buffering.
+- **`on_speaking_change(is_speaking)` / `cancel()`** — `is_speaking=True`
+  cancels `self._pending` (the task running `_finish_answer`);
+  `is_speaking=False` schedules `_run_after_silence()` after the configured
+  silence window (`resume_room_answer_silence_seconds` if awaiting an
+  answer, else `resume_room_silence_hardbound_seconds`). `_run_after_silence`
+  branches to `_finish_answer()` if there's an actual answer to grade
+  (`_awaiting_answer` or a non-empty `_buffer` on an open round), else to
+  `_advance_from_queue()` — the idle/recovery path.
 - **`_open_round(question, *, forced, target=None)`** — speaks the question
-  (`TTSSpeakFrame(text=..., append_to_context=False)` via
-  `worker.queue_frames`), resets per-round state (`_buffer=[]`,
-  `_awaiting_answer=True`, `_current_round_forced=forced`,
-  `_regrade_attempts=0`), then `crud.start_round(..., target=target)`
-  (shielded) sets `_current_round_id`. `target` is `{"block", "item_id",
-  "fields"}` (`fields` an optional list of field names) describing what the
-  question is about — already built/sanitized
-  by the caller (`_advance_round`, below) — stored verbatim on the round so
-  a later `UNABLE_TO_ANSWER` grade can be committed back into
-  `field_completeness` precisely (see
-  [backend/completeness-pipeline.md](completeness-pipeline.md)'s
-  `build_unable_to_answer_patch`).
+  (`TTSSpeakFrame`, `append_to_context=False`), resets per-round state, then
+  `crud.start_round(..., forced_topic=forced, target=target)` (shielded)
+  sets `_current_round_id`. `target` is `{"block", "item_id", "fields"}`,
+  stored verbatim so a later `UNABLE_TO_ANSWER` grade can be committed back
+  into `field_completeness` precisely.
 - **`_probe_round(question)`** — same speak/state-reset, but calls
   `crud.append_round_question` on the *same* `_current_round_id` instead of
-  opening a new one — the round stays open, its exchange count grows.
-- **`record_candidate_text(text)`** — unchanged: buffers finalized STT
-  chunks into `self._buffer` while `_awaiting_answer`, purely additive; see
-  "Data flow & dependencies" below for why every line also always reaches
-  the transcript/extraction queue live, independent of this buffering.
-- **`on_speaking_change(is_speaking)` / `cancel()`** — unchanged cancel-on-
-  resume debounce logic: `on_speaking_change(True)` cancels `self._pending`
-  (the task running `_finish_answer`), `_run_after_silence()` schedules the
-  eventual grading/advance call after the configured silence window.
-  `_run_after_silence` branches to `_finish_answer()` if there's an actual
-  answer to grade (`_awaiting_answer` or a non-empty `_buffer` on an open
-  round), else to `_advance_round()` with no `next_question` of its own —
-  the idle/recovery path.
+  opening a new one.
+- **`_pop_next_queue_item(exclude_key)`** — pops `questions.queue` in a loop,
+  silently discarding any entry whose `key` matches `exclude_key` before
+  returning the first one that doesn't. Exists because the queue is
+  regenerated asynchronously by the analysis worker: a snapshot popped
+  immediately after a round closes (see `_advance_from_queue`'s
+  fire-and-forget flush, below) can still list that exact round's own gap/
+  forced-topic key if the regeneration cycle that would have dropped it
+  hasn't landed yet. Discarding it is safe — the real state (the round's
+  answer, its terminal grade or given-up status) is already committed, so
+  the next genuine regeneration cycle won't reinsert it; the popped item was
+  simply stale.
+- **`_advance_from_queue(pending_flush=None, *, exclude_key=None)`** — the
+  sole replacement for what used to be a parameterized `_advance_round`:
+  ```python
+  async def _advance_from_queue(
+      self, pending_flush: Optional[FlushRequest] = None, *, exclude_key: Optional[str] = None,
+  ) -> None:
+      item = await self._pop_next_queue_item(exclude_key)
+      if item is None and pending_flush is not None:
+          await asyncio.wait_for(pending_flush.done.wait(), timeout=settings.resume_room_flush_timeout_seconds)
+          item = await self._pop_next_queue_item(exclude_key)
+      if item is None:
+          await self._complete_interview()
+          return
+      key = item.get("key") or ""
+      forced = key if key.startswith(("conflict:", "unresolved:")) else None
+      target = {"block": item.get("block"), "item_id": item.get("item_id"), "fields": item.get("fields")}
+      await self._open_round(item["question"], forced=forced, target=target)
+  ```
+  No LLM call — the combined analysis call already worded `item["question"]`.
+  `pending_flush` is the `FlushRequest` handle from this same turn's
+  fire-and-forget flush (see below) — the first pop always reads whatever
+  `questions.queue` already holds, off the critical path entirely; only an
+  empty first pop falls back to awaiting that in-flight batch and popping
+  again, so the interview-ending decision never fires on a merely-stale
+  (not-yet-updated) queue. `exclude_key` is the just-closed round's own
+  gap/forced-topic key (see `_finish_answer`'s ordinary-round path, below) —
+  filtering it out is what stops a stale-but-non-empty queue snapshot from
+  immediately re-asking the exact target this round just closed. Once both
+  the exclusion filter and the pending-flush retry are exhausted, the
+  interview genuinely ends — the queue is exhaustive by construction.
 
-**`_finish_answer()`** — once the answer-silence window elapses:
-1. Builds `resume`/`field_completeness`/`history` from a fresh `get_session`
-   read (`_build_conversation_history` flattens every round's exchanges, in
-   `round_order` order, into `[{"question", "answer"}, ...]` — the *whole*
-   session, no windowing/truncation). Also reads `round_row =
-   questions.rounds[round_id]` from this same row (safe this early —
-   `record_round_answer` only ever fills an existing exchange's `answer`
-   field, it never changes `questions.rounds`' shape) to get
-   `current_target = round_row.get("target")` — this round's own
-   already-known subject — and computes `next_target_candidates =
-   next_target.compute_next_targets(resume, ASKABLE_COVERAGE_SCHEMA,
-   field_completeness, exclude_targets=...)`, excluding `current_target`'s own
-   `(block, item_id)` plus every pair in `self._organic_targets_given_up`
-   (see below). Both are threaded into the fused call in step 3 below — see
-   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)'s
-   `next_target.compute_next_targets` for exactly how that list is built and
-   ordered.
-2. Fires `orchestrator.flush_transcript(session_id, wait=False)` —
-   fire-and-forget, never awaited here. This is Task A: the unchanged
-   extraction+coverage pipeline, running purely in the background. Task B
-   below is the turn's only critical-path work.
-3. Awaits `question_chain.run_question_chain(resume, ASKABLE_COVERAGE_SCHEMA,
-   history, answer_text, field_completeness=field_completeness,
-   current_target=current_target,
-   next_target_candidates=next_target_candidates)` — the ONE LLM call for
-   the whole turn. `ASKABLE_COVERAGE_SCHEMA` (`coverage_schema.py`'s
-   `COVERAGE_SCHEMA` with every `not_applicable` block removed) is used here
-   instead of the raw schema so the fused call can never draft a question
-   about `personal`/`summary` — that information is captured elsewhere in the
-   product, never through this interview. `field_completeness` (the batched
-   worker's last per-field/per-item verdicts, possibly a turn or more stale)
-   grounds `probe_question` in exactly which of `current_target`'s fields are
-   still open, so a probe targets precisely what's missing on the current
-   item instead of padding in a generic re-ask for something already given.
-   Target *selection* for `next_question` is no longer the model's own
-   choice: it must pick the first entry in `next_target_candidates` not
-   already resolved by the live conversation (including this very answer,
-   which `field_completeness` hasn't caught up to yet) — the list is
-   exhaustive by construction, so "every candidate already resolved"
-   legitimately means nothing is left. Whenever `next_question` is non-null,
-   the same response self-reports `next_question_target` (validated against
-   `next_target_candidates` by `question_chain._validate_next_target` before
-   being trusted — see
-   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)),
-   carried forward to step 4's `_advance_round` call below. If
-   `is_meta_question` and `meta_response`: records the aside under
-   `user_aside`/`assistant_aside` transcript roles (invisible to extraction,
-   which only reads `role == "user"`) and diverts to
-   `_handle_meta_question` — **without** ever calling
-   `crud.record_round_answer`, since a round's exchange is a fixed one-shot
-   `{question, answer}` slot (unlike the old free-form per-target message
-   log) and filling it with the off-topic aside would leave no open slot
-   for the real answer that follows once the pending question is re-spoken.
-4. Otherwise starts `crud.record_round_answer` as a shielded task (created,
-   not yet awaited — see "Bookkeeping writes deferred past the TTS queue"
-   below), computes `capped` from `round_row` (the same one read in step 1,
-   not a fresh `get_session`)'s exchange count vs. its stamped
-   `max_questions`. If `capped and not terminal`, also adds
-   `(current_target["block"], current_target.get("item_id"))` to
-   `self._organic_targets_given_up` (when `current_target` is set) — this
-   round is giving up on a subject `field_completeness` will never be
-   patched for, so without this it would otherwise be handed straight back
-   as the top-priority `next_target_candidates` entry next round. Then
-   branches on `answer_grade`:
-   - **non-terminal (`PARTIAL`), under cap, `probe_question` present** →
-     `_probe_round(probe_question)` (queues the probe's `TTSSpeakFrame`
-     first), *then* awaits the `record_round_answer` task.
-   - **non-terminal, under cap, no probe at all** (a fail-soft empty result,
-     or a response that ignored the always-draft instruction) → restore the
-     answer to `self._buffer` with `_awaiting_answer` re-armed (then await
-     the `record_round_answer` task), so the next silence re-grades the
-     whole thing through the same call, bounded by
-     `InterviewDirector._MAX_REGRADE_ATTEMPTS` (1).
-   - **terminal, or capped** → starts `crud.close_round(..., grade=...)` as
-     another shielded task; if the grade is `UNABLE_TO_ANSWER`, reads the
-     closing round's own stored `target` (from the same already-fetched
-     row) and, if set, builds a patch via
-     `build_unable_to_answer_patch(field_completeness, target)` and, if
-     non-empty, starts a shielded `crud.apply_field_completeness` task too —
-     the one write path around the batched grader's structural inability to
-     ever detect a verbal decline on its own (see
-     [backend/completeness-pipeline.md](completeness-pipeline.md)). Only for
-     `UNABLE_TO_ANSWER` — `SUFFICIENT`/`PARTIAL` stay exclusively Task A's
-     call. If the round was forced, its key joins `_forced_topics_spent`;
-     hands off to `_advance_round(result.get("next_question"),
-     result.get("next_question_target"))` **before** awaiting any of the
-     three bookkeeping tasks started above — see below.
+**`_finish_answer()`** — once the answer-silence window elapses, branches on
+whether the round has a real `target` (read from the round's own stored
+row, `round_row.get("target")`):
 
-**Bookkeeping writes deferred past the TTS queue.** `record_round_answer`/
-`close_round`/`apply_field_completeness` don't affect what the next question
-says, only session-state persistence, so none of them need to complete
-before the next question/probe is queued for TTS. Each is started via
-`asyncio.shield(...)` (which schedules the underlying CRUD call to run
-immediately) but the `await` on that shield is deferred until *after* the
-call that queues the next `TTSSpeakFrame` (`_probe_round`, or
-`_advance_round` → `_open_round`) — so the write runs concurrently with, not
-serialized before, the speak. They're still awaited (not truly fire-and-
-forgotten) before `_finish_answer` returns, preserving the original
-cancellation/error-propagation behavior (a real exception still bubbles to
-`_run_after_silence`'s `except Exception: logger.exception(...)`).
-5. `except asyncio.CancelledError` (candidate resumed speaking mid-grading):
-   if the answer wasn't graded yet, restores `_awaiting_answer` and
-   prepends the original `answer_text` back onto `self._buffer` (ahead of
-   whatever accumulated during the cancelled call), then re-raises. See
-   "Cancel-safe turns" below.
-
-**`_advance_round(next_question=None, next_question_target=None)`** — the
-shared round-open decision, called from `_finish_answer`'s terminal/capped
-path (with Task B's own `next_question`/`next_question_target`) and from
-`_run_after_silence`'s idle branch (with both `None`):
-1. **Forced topic check, always first.** `_pick_forced_topic(resume)` scans
-   `resume["conflicts"]` then `resume["unresolved"]` for a record whose key
-   (`"conflict:<id>"`/`"unresolved:<id>"`) isn't already in
-   `_forced_topics_spent`. If found: builds a natural-language
-   `topic_description` from the record via `_forced_topic_description(key,
-   record, resume)` (conflict — "resolving a conflict: earlier the
-   candidate's `<field>`[ for their `<item label>`] was recorded as
-   `<existing>`, then as `<alt>` — need to know which is correct"; unresolved
-   — "clarifying an ambiguous earlier statement: `"<text>"` — need to know
-   which part of the resume this belongs to"). The `<item label>` clause
-   uses `_item_label(resume, block, item_id)` (below) to name the specific
-   experience/education/etc. item a conflict concerns, when the record
-   carries one — e.g. "their Generative AI Intern at AI Solve" rather than
-   leaving it ambiguous which of several entries is meant. Words the topic
-   via `question_chain.run_topic_question_chain` (passing
-   `field_completeness=row.get("field_completeness") or {}` alongside the
-   full, unfiltered `COVERAGE_SCHEMA` — the topic here is already
-   pre-decided by Python, so there's no block-selection risk needing the
-   askable filter), builds `target = {"block": record.get("block"),
-   "item_id": record.get("item_id"), "fields": [record["field"]] if
-   record.get("field") else None}` (a conflict record's single `field` is
-   wrapped in a one-element list to match the target shape everywhere else;
-   an unresolved record only ever carries `block`, so `item_id`/`fields`
-   come back `None` — still meaningfully better than nothing), and opens a
-   forced round via `_open_round(worded["question"], forced=key,
-   target=target)`.
-   Whatever `next_question`/`next_question_target` Task B organically
-   drafted this turn is discarded outright — a conflict or unresolved fact
-   outranks anything the LLM proposed on its own.
-2. **Else, if `next_question` is truthy**, opens it directly
-   (`_open_round(next_question, forced=None, target=next_question_target)`)
-   — no sanitization needed here any more: `next_question_target` already
-   came back from `question_chain.run_question_chain` validated against the
-   exhaustive `next_target_candidates` list `_finish_answer` computed and
-   handed it (see above), so it's guaranteed to name one of those candidates
-   (or the fallback candidate #1, on any mismatch/hallucination) rather than
-   an arbitrary block/field pair.
-3. **Else (`next_question` falsy) → `_complete_interview()` directly.**
-   No intermediate safety-net call of any kind: since
-   `next_target_candidates` was already the complete remaining
-   priority-ordered list of everything askable, a null `next_question`
-   means the fused call determined every one of those candidates was
-   already resolved — which, because the list was exhaustive, is the same
-   thing as "genuinely nothing left to ask." There is no
-   `find_required_gap`/`required_gap.py` any more (deleted — see
-   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) and
-   no `_await_task_a_settle` (deleted too, since its only caller was this
-   now-removed branch) — this tier never awaits Task A or re-reads
-   `field_completeness` at all.
+- **Opening round (`current_target is None`)** — no grading call at all: a
+  multi-block opener has no single `complete_when` bar. Marks answered,
+  closes the round (`grade=None` — the round shape's `grade` field is
+  already `Optional[str]`), clears round state, fires
+  `orchestrator.flush_transcript(..., wait=False)` (fire-and-forget, keeping
+  the LLM round trip off this turn's critical path) and passes the returned
+  `FlushRequest` straight into `_advance_from_queue(pending_flush)`, which
+  only awaits it if the immediate pop comes back empty (see
+  `_advance_from_queue` above).
+- **Every other round**:
+  1. Builds `history` (`_build_conversation_history` flattens every round's
+     exchanges, oldest first, into `[{"question", "answer"}, ...]`) and
+     `target_complete_when = complete_when_for_target(ASKABLE_COVERAGE_SCHEMA,
+     current_target)`.
+  2. Fires `orchestrator.flush_transcript(session_id, wait=False)` —
+     fire-and-forget, off this turn's critical path; the combined analysis
+     call runs entirely in the background.
+  3. Awaits `run_answer_grading_chain(history, answer_text,
+     target_complete_when)` — the ONE LLM call for this turn.
+  4. Meta-question branch (`is_meta_question`/`meta_response`): records the
+     aside under `user_aside`/`assistant_aside` transcript roles (invisible
+     to extraction) and diverts to `_handle_meta_question` — **without**
+     ever calling `crud.record_round_answer`, since a round's exchange is a
+     fixed one-shot slot.
+  5. Otherwise starts `crud.record_round_answer` as a shielded, deferred
+     task, computes `grade`/`terminal`/`capped` from the round's own
+     exchange count vs. `max_questions`, then branches:
+     - **non-terminal, under cap, `probe_question` present** →
+       `_probe_round(probe_question)`, await `record_answer_task`, return.
+     - **non-terminal, under cap, no probe at all** — restore the answer to
+       `self._buffer` with `_awaiting_answer` re-armed, bounded by
+       `_MAX_REGRADE_ATTEMPTS` (1).
+     - **terminal, or capped** — proceeds to close the round.
+  6. **Await-ordering fix (load-bearing, not just latency).** Three writes
+     change what the very NEXT candidate-queue computation
+     (`analysis_orchestrator._run_batch`, in a different asyncio task) will
+     see: `mark_target_given_up` (on capped-and-non-terminal),
+     `mark_forced_topic_spent` (on a forced round closing), and the
+     `UNABLE_TO_ANSWER` `apply_field_completeness` patch (via
+     `build_unable_to_answer_patch`). All three are **awaited immediately**
+     (`await asyncio.shield(...)`), **before** the flush that triggers the
+     next combined-call cycle — not deferred alongside
+     `record_answer_task`/`close_round_task`, which are pure bookkeeping
+     that doesn't affect candidate-queue computation and stay deferred for
+     latency. Deferring the three exclusion-relevant writes instead would
+     race the flush-triggered combined call, letting a just-declined/
+     just-capped/just-forced target reappear in the immediately-next queue.
+  7. Computes `closing_key` (this round's own `forced_topic`, else
+     `gap_key(target.block, target.item_id)`) BEFORE clearing
+     `_current_round_id`/`_current_round_forced`, then fires
+     `orchestrator.flush_transcript(..., wait=False)` and passes the
+     returned `FlushRequest` into `_advance_from_queue(pending_flush,
+     exclude_key=closing_key)` (see above — same fire-and-forget-with-
+     fallback shape as the opening-round path, plus the exclusion filter so
+     a stale queue snapshot can't immediately re-ask the target this round
+     just closed), then awaits the deferred `record_answer_task`/
+     `close_round_task` (swallowing `CancelledError`).
+- **`except asyncio.CancelledError`** (candidate resumed speaking
+  mid-grading): if the answer wasn't graded yet (`graded` flag not yet
+  flipped), restores `_awaiting_answer` and prepends the original
+  `answer_text` back onto `self._buffer`, then re-raises. Once `graded` has
+  flipped `True`, a cancellation only affects already-shielded writes in
+  flight, which finish independently.
 
 **Doubt/meta-question handling** — the candidate can go off-script mid-
-answer to ask about the process itself ("how long is this?") instead of
-answering, detected as one extra field on the *same* per-answer grading
-call (no added LLM round-trip). `_handle_meta_question(response_text)`
-speaks it, then **re-speaks the exact pending question** (cached in
-`self._current_question_text`, set every time `_open_round`/`_probe_round`
-runs), re-arms `_awaiting_answer`, and leaves `_buffer` empty — no probe
-spent, no round state otherwise touched.
+answer to ask about the process itself, detected as one extra field on the
+*same* per-answer grading call (no added LLM round-trip).
+`_handle_meta_question(response_text)` speaks it, then **re-speaks the
+exact pending question** (cached in `self._current_question_text`), re-arms
+`_awaiting_answer`, and leaves `_buffer` empty — no probe spent, no round
+state otherwise touched.
 
 **Session bootstrap and closing** — with no persona to fall back on, the
 director owns both ends of the session:
@@ -300,26 +260,16 @@ director owns both ends of the session:
 - `_complete_interview()` — speaks the fixed `CLOSING_MESSAGE` exactly once
   (guarded by `self._closed`), then calls `self._on_complete()`
   (`bot.end_session`), which queues an `EndFrame` right behind the closing
-  `TTSSpeakFrame` — pipecat processes queued frames in order, so the
-  `EndFrame` only tears down the transport once the closing message has
-  actually been synthesized and pushed to output. `_leave_interview_mode()`
-  clears `_awaiting_answer`/`_current_round_id`/`_current_round_forced`/
-  `_current_question_text`/`_buffer`.
-
-**Cancel-safe turns.** `on_speaking_change(True)` cancels `self._pending` —
-the very task running `_finish_answer` — so a candidate who resumes
-speaking mid-grading cancels their own turn. `_finish_answer` therefore
-holds `_awaiting_answer` set until `run_question_chain` has actually
-returned, and its `except asyncio.CancelledError` restores the turn
-(`_awaiting_answer` back on, answer text prepended to whatever accumulated
-during the call) so the next silence re-grades the whole thing through the
-same single call. There is no separate `flush_task` to cancel/track in this
-path any more (unlike the old design): `flush_transcript(..., wait=False)`
-just enqueues a `FlushRequest` and returns almost immediately, so it's
-awaited directly rather than wrapped in its own tracked task.
+  `TTSSpeakFrame` — the `EndFrame` only tears down the transport once the
+  closing message has actually been synthesized and pushed to output. The
+  rest of teardown (`_on_bot_done`/`_close_out`) is the same path every
+  other session end goes through — see
+  [backend/room-orchestration.md](room-orchestration.md).
+- `_leave_interview_mode()` clears `_awaiting_answer`/`_current_round_id`/
+  `_current_round_forced`/`_current_question_text`/`_buffer`.
 
 **TTS is never interrupted by user speech.** `pipeline.py`'s
-`LLMContextAggregatorPair` construction now passes an explicit
+`LLMContextAggregatorPair` construction passes an explicit
 `user_turn_strategies`:
 ```python
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -335,69 +285,17 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     ),
 )
 ```
-Verified directly against the installed `pipecat` source
-(`pipecat.turns.user_start`, `pipecat.turns.user_turn_strategies`):
 `enable_interruptions=False` only suppresses `broadcast_interruption()` (the
 call that sends the `InterruptionFrame` cancelling in-flight TTS synthesis)
 — it does **not** touch `enable_user_speaking_frames` (default `True`,
 unaffected), which is the separate flag that still emits
 `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame`, the frames every
-silence/turn-detection timer in this file depends on. `vad_analyzer=
-SileroVADAnalyzer()` builds an independent `VADController` regardless of the
-explicit `user_turn_strategies` list, so speaking-state detection is
-unaffected end-to-end — only the "cut off the bot's own TTS" behavior is
-suppressed.
+silence/turn-detection timer in this file depends on.
 
-**Observable side effect worth knowing**: `AgentTranscriptBridge._clear_drip`
-in `bridges.py` still reacts to `InterruptionFrame` to cut the caption drip
+**Observable side effect**: `AgentTranscriptBridge._clear_drip` in
+`bridges.py` still reacts to `InterruptionFrame` to cut the caption drip
 short. With interruption broadcast suppressed, captions keep dripping for
-the full bot utterance even while the candidate talks over it — consistent
-with "never cut off the bot," but visually the caption may keep animating
-after the user starts speaking.
-
-Three things the director owns beyond the round machinery above:
-- **`_item_label(resume, block, item_id) -> Optional[str]`** (staticmethod)
-  — a short human-readable label for one specific item of a repeatable
-  block (`experience` → `"{role} at {company}"`, `education` →
-  `"{degree} at {college}"`, `projects`/`certifications`/`courses` → the
-  item's own `name`), `None` if `block`/`item_id` don't resolve to an actual
-  existing item. Folded into `_forced_topic_description`'s conflict wording
-  so a forced question about a specific job/degree/project names it rather
-  than leaving it ambiguous which of several entries is meant — the same
-  problem `next_question_target`'s `item_id` solves for organic questions,
-  solved here on the deterministic forced-topic path.
-- **`_organic_targets_given_up: Set[Tuple[str, Optional[str]]]`** — every
-  `(block, item_id)` a round gave up on (capped while still non-terminal),
-  permanent for the session. Passed as part of `exclude_targets` to every
-  later `next_target.compute_next_targets` call so a stuck subject — one
-  `field_completeness` will never mark terminal on its own, since the
-  candidate never actually resolved it — can't deterministically win top
-  priority forever now that selection is no longer up to the LLM's own
-  judgment. A block that genuinely turns terminal later still drops out on
-  its own via `compute_next_targets`'s terminal-status filter, independent
-  of this set. The trust boundary for `next_question_target` itself moved
-  into `question_chain._validate_next_target` (see
-  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) —
-  there's no longer a director-side `_sanitize_target` (deleted): it's
-  cheaper to validate containment in the small Python-built candidate list
-  than the whole coverage schema, and that check now lives next to the call
-  that produces the value being checked.
-- **`_forced_topics_spent: Set[str]`** — see
-  [backend/completeness-pipeline.md](completeness-pipeline.md)'s "The
-  interview loop". New, director-only, in-memory anti-infinite-loop state;
-  replaces the old session-lifetime `_abandoned`/`abandoned_paths`/
-  `mark_target_abandoned` machinery entirely — there is no equivalent
-  cross-round bookkeeping for organic (non-forced) topics any more, since
-  Task B is trusted to not loop on its own.
-- Questions are spoken by queueing a `TTSSpeakFrame(text=...,
-  append_to_context=False)` on the worker — same injection point used for
-  the opening question, doubt responses, probes, and the closing line.
-  `append_to_context=False` is deliberate: there's no chat context
-  downstream to pollute.
-- `on_speaking_change(is_speaking)` drives the whole state machine with the
-  same cancel-on-resume debounce the batched completeness worker uses —
-  only the wait duration and the action differ. `cancel()` kills any
-  pending task at teardown.
+the full bot utterance even while the candidate talks over it.
 
 ## Data flow & dependencies
 - Reads config from `app.core.config.settings`
@@ -407,28 +305,24 @@ Three things the director owns beyond the round machinery above:
   `pipeline.py`'s `persist()` closure. For `role == "user"`, `persist()`
   always offers the line to `director.record_candidate_text(text)` (a
   buffering side effect only) *and* always does `crud.append_transcript_line`
-  + (for `user`) `orchestrator.enqueue_transcript` — the handoff into
-  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) — the
+  + `orchestrator.enqueue_transcript` — the handoff into
+  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md), the
   same path used outside interview mode, unconditionally, mid-answer
   included, so extraction can fire on character count alone however long
-  the candidate keeps talking, not just once they go silent.
-  `persist("assistant", ...)` is unaffected, so a directly-spoken interview
-  question still lands in the transcript as an assistant line — keeping
-  question-then-answer ordering intact for extraction.
-- `UserTranscriptBridge`'s `on_speaking_change` callback fans out to *two*
-  consumers: `orchestrator.enqueue_speaking_state` (the batched grading
-  worker, cross-process via a queue) and `director.on_speaking_change` (a
-  direct in-process call, since the director lives inside `run_bot` and
-  holds `worker` directly).
+  the candidate keeps talking.
+- `UserTranscriptBridge`'s `on_speaking_change` callback is now a single
+  direct in-process call to `director.on_speaking_change` — there is no
+  second, cross-process consumer any more (the old batched completeness
+  worker's speaking queue is gone entirely — see
+  [backend/completeness-pipeline.md](completeness-pipeline.md)).
 - **VAD is kept even though the chat LLM is gone.** `pipeline.py` still
   builds `context_llm = LLMContext()` and the `LLMContextAggregatorPair`
-  above, keeping both aggregators in the `Pipeline([...])` list. This is
-  pipecat's *only* configured source of `UserStartedSpeakingFrame`/
-  `UserStoppedSpeakingFrame` — remove this pair and *all* silence/turn
-  detection breaks, not just chat. Pipecat's standalone `VADProcessor` is
-  not a drop-in alternative: it emits a different frame type
-  (`VADUserStartedSpeakingFrame`), which `UserTranscriptBridge`'s
-  `isinstance` checks would not match.
+  above. This is pipecat's *only* configured source of
+  `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame` — remove this pair
+  and *all* silence/turn detection breaks, not just chat. Pipecat's
+  standalone `VADProcessor` is not a drop-in alternative: it emits a
+  different frame type (`VADUserStartedSpeakingFrame`), which
+  `UserTranscriptBridge`'s `isinstance` checks would not match.
 - Depends on external services: Sarvam STT/TTS and Daily transport/VAD
   (Silero) — all via pipecat service classes, not called directly.
 - Only ever invoked from `room_orchestrator._run_guarded_bot` (lazy import,
@@ -437,130 +331,80 @@ Three things the director owns beyond the round machinery above:
 ## Conventions & gotchas
 - `AGENT_CAPTION_WORDS_PER_SECOND` (2.5) in `bridges.py` is a deliberate
   approximation: Sarvam's TTS has no word-boundary timing events, so agent
-  captions are dripped out word-by-word at a fixed pace to *look* like
-  they're keeping pace with audio, rather than jumping to the full sentence
-  instantly. Don't remove the drip queue without understanding this — see
-  the long comment at the top of `bridges.py`.
+  captions are dripped out word-by-word at a fixed pace, rather than
+  jumping to the full sentence instantly.
 - `AgentTranscriptBridge`'s drip queue must be cleared on
   `InterruptionFrame` (`_clear_drip`) or a stale sentence keeps dripping
-  words after the bot has actually been interrupted — see the TTS-
-  interruption-suppression note above for why this frame is now rarer.
+  words after the bot has actually been interrupted.
 - `GREETING_MESSAGE` (`pipeline.py`) and `CLOSING_MESSAGE`
-  (`interview_director.py`) are literal spoken text, not LLM instructions —
-  changing tone here changes the product's core interaction style directly,
-  with no LLM paraphrasing in between.
+  (`interview_director.py`) are literal spoken text, not LLM instructions.
 - New STT/TTS providers are added by writing a new builder function and
   adding it to that module's `BUILDERS`/`builders` dict, then pointing the
-  matching `settings.resume_room_*_provider` at its key — never by adding
-  conditional branches elsewhere.
+  matching `settings.resume_room_*_provider` at its key.
 - `ParticipantTracker.schedule_teardown` cancels the pipeline worker
   (`worker.cancel()`) after `resume_room_empty_room_grace_seconds` of an
   empty room — a pending teardown task is cancelled again if a participant
   rejoins in that window.
 
 ## Last synced
-2026-09-05 (yet later still — deterministic block-priority target selection:
-a live session showed the fused call bouncing between blocks
-(`projects` → `experience` → `education` → ...) instead of exhausting one at
-a time, because it was never given the round's own `current_target` and had
-no enforced ordering for `next_question_target`. `_finish_answer` now reads
-`current_target` from the round's own stored `target` and computes
-`next_target_candidates` via the new
-`next_target.compute_next_targets(resume, ASKABLE_COVERAGE_SCHEMA,
-field_completeness, exclude_targets=...)` (touched blocks before untouched,
-each in `objective_priority` order — see
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)), both
-threaded into the same fused `run_question_chain` call — grading + question
-wording is still exactly ONE LLM call, only target *selection* moved to
-Python. `next_question_target` is now validated against that candidate list
-by `question_chain._validate_next_target` before being trusted, so
-`_advance_round` opens it directly with no sanitization step of its own.
-Deleted as a result (fully superseded, no remaining callers): `required_gap.py`/
-`find_required_gap` (the exhaustive candidate list makes its narrower
-required-tier-only safety net redundant — there is no more fallback tier at
-all, a null `next_question` now goes straight to `_complete_interview()`),
-`_sanitize_target` (validation moved to `question_chain._validate_next_target`,
-next to where the value is produced), and `_await_task_a_settle` (its only
-caller was the now-removed required-gap branch). Added
-`_organic_targets_given_up` (mirrors `_forced_topics_spent`) so a block/item
-that caps out while still non-terminal doesn't deterministically win top
-priority forever now that selection is fully deterministic.)
-2026-09-05 (yet later still — latency fix: `_finish_answer` now starts
-`record_round_answer`/`close_round`/`apply_field_completeness` as shielded
-tasks but defers awaiting them until after the next question/probe's
-`TTSSpeakFrame` is queued, and drops a redundant `get_session` re-fetch in
-favor of reusing the row already fetched earlier in the same turn (safe
-since nothing else touches `questions.rounds`/`field_completeness`
-concurrently in that window). `_advance_round`'s own `get_session` at its
-start is unchanged/kept — Task A's fire-and-forget extraction genuinely can
-mutate `resume_data` concurrently, so that one still needs a fresh read.
-See [backend/llm-providers.md](llm-providers.md) for the paired
-`reasoning.effort` change from the same latency investigation.)
-2026-09-05 (later still — round 3 (part 1): a live run showed one
-experience item getting four separate rounds, one per remaining open field
-(`location`, then `projects`, then `achievements`, then `awards`), because
-`target`'s `field` slot could only ever name one. Renamed `field` → `fields`
-(`Optional[List[str]]`) everywhere a round `target` is built or read:
-`_sanitize_target` now filters `fields` against the block's real field
-keys instead of coercing a single string; the forced conflict/unresolved
-branch wraps the record's single `field` into a one-element list; the
-required-gap branch's `target` is unchanged apart from the rename.
-`build_unable_to_answer_patch` (see
-[backend/completeness-pipeline.md](completeness-pipeline.md)) now commits
-every field in the list on a decline, not just one. Paired with a new
-"consolidate, don't drip-feed" prompt rule (see
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) so
-Task B folds every currently-open field of a targeted item/block into ONE
-question instead of asking them one at a time across separate rounds.
-Priority/ordering across different blocks remains a known, separate,
-explicitly-deferred follow-up.)
-2026-09-05 (later same day — round 2 of live-session bug fixes, target
-bookkeeping: `_open_round`/`crud.start_round` gained a `target` param
-(`{"block", "item_id", "field"}`, stored on the round) built at all three
-`_advance_round` round-open sites — from the conflict/unresolved record
-directly, from Task B's own sanitized `next_question_target`
-(`_sanitize_target`, new), or `{"block": gap_block}` for a required-gap
-round. `_finish_answer` now reads the closing round's `target` and, on an
-`UNABLE_TO_ANSWER` grade, commits `build_unable_to_answer_patch`'s result
-into `field_completeness` — closing the one gap the batched grader can
-never fill on its own (a verbal decline produces no `resume_data` value to
-ever judge). Added `_item_label` to name a specific experience/education/
-etc. item in forced-topic wording, fixing an ambiguity that surfaces once a
-candidate has more than one entry in a repeatable block. See
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) (prompt
-rules + `next_question_target`) and
-[backend/completeness-pipeline.md](completeness-pipeline.md)
-(`build_unable_to_answer_patch`) and
-[backend/database-models.md](database-models.md) (`target` on the round
-row).)
-2026-09-05 (bug fixes from live-session testing: the fused call's `coverage`
-argument at the `_finish_answer` call site switched from `COVERAGE_SCHEMA`
-to `ASKABLE_COVERAGE_SCHEMA` — a live session had the bot ask for the
-candidate's full name/email/phone, a `not_applicable` block it should never
-surface as a question. Also threaded `field_completeness` into all three
-`run_question_chain`/`run_topic_question_chain` call sites — another live
-session showed a probe padding in an irrelevant re-ask for responsibilities
-the candidate had already given, because the chain had no ground truth for
-exactly which fields of the current item were still open. See
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) for the
-chain-level detail.)
-2026-09-05 (`interview_director.py` rewritten top-to-bottom, ~1500 → ~460
-lines: replaced per-target selection/shortlist/field-group-batching/pending-
-BLOCK-claim verification with a round-based state machine
-(`_open_round`/`_probe_round`/`_advance_round`/`_pick_forced_topic`/
-`_await_task_a_settle`/`_forced_topics_spent`) trusting one fused per-answer
-LLM call (`question_chain.run_question_chain`) directly, with two small
-deterministic guardrails (forced conflict/unresolved priority, a
-required-coverage safety net before ending). Also fixed `pipeline.py` so the
-bot's own TTS is never interrupted by resumed user speech
-(`VADUserTurnStartStrategy(enable_interruptions=False)`), while leaving
-speaking-state detection (VAD/silence timers) fully intact. Settings
-renamed `resume_room_max_probes_per_target` →
-`resume_room_max_questions_per_round`; `resume_room_dedup_candidate_targets`/
-`resume_room_next_target_shortlist_size`/
-`resume_room_next_question_transcript_lines` deleted (fed only the removed
-shortlist machinery). See
-[backend/completeness-pipeline.md](completeness-pipeline.md) and
-[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md). Older
-history predating this rewrite described the deleted selection/shortlist/
-claim machinery in detail and has been removed from this file.)
+2026-09-05 (later still — fixed a live regression from the fire-and-forget
+flush change just below: a round that just closed (SUFFICIENT,
+UNABLE_TO_ANSWER, or given-up-on-capped) could be immediately re-asked,
+because the queue snapshot popped right after closing it was sometimes a
+stale one from BEFORE that closure had been folded into a regeneration
+cycle -- the previous fix only guarded an EMPTY pop, not a non-empty-but-
+stale one. New `_pop_next_queue_item(exclude_key)` discards any popped entry
+whose key matches the just-closed round's own gap/forced-topic key;
+`_advance_from_queue` gained a matching `exclude_key` parameter, and
+`_finish_answer`'s ordinary-round path now computes `closing_key` before
+clearing `_current_round_forced`/the round's target and passes it through.
+The opening-round path is unaffected (no single target, so nothing to
+exclude).)
+2026-09-05 (later still — removed the two remaining `flush_transcript(...,
+wait=True)` calls before `_advance_from_queue()` (opening-round and
+ordinary-round paths in `_finish_answer`), which were adding a full
+combined-analysis LLM round trip to every turn's latency before the next
+question could be spoken. Both now fire `wait=False` and pass the returned
+`FlushRequest` into `_advance_from_queue(pending_flush)`, which pops
+`questions.queue` immediately (usually already populated from a prior
+cycle) and only falls back to awaiting `pending_flush` if that first pop
+comes back empty — preserving the one correctness property the blocking
+wait existed for (never reading an empty-but-merely-stale queue as "genuinely
+nothing left to ask" and ending the interview early). `ResumeRoomOrchestrator.flush_transcript`
+now returns the `FlushRequest` (or `None`) in both the `wait=True` and
+`wait=False` cases, rather than `None` always, so a `wait=False` caller can
+still observe completion later on demand. See
+[backend/room-orchestration.md](room-orchestration.md) for
+`flush_transcript`'s own doc entry if one exists, and
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) for
+`FlushRequest`'s definition.)
+2026-09-05 (major rewrite, ~500 lines top-to-bottom — replaced per-target
+selection (`_pick_forced_topic`/`_forced_topic_description`/`_item_label`,
+the in-memory `_organic_targets_given_up`/`_forced_topics_spent` sets, the
+inline `compute_next_targets` call in `_finish_answer`) with a
+queue-popping design: `_advance_from_queue` just pops the head of
+`questions.queue` (regenerated wholesale by the combined analysis call —
+see [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) and
+opens a round for it, no LLM call at pop time. `_finish_answer` now calls
+the narrow `question_chain.run_answer_grading_chain` (only the round's own
+`target_complete_when` bar, no resume/coverage/candidate-list inputs at
+all) and branches on whether the round has a `target` at all (the opening
+round has none, so it skips grading entirely). Exclusion bookkeeping
+(`given_up_targets`/`forced_topics_spent`) moved off `InterviewDirector`'s
+in-memory sets onto the persisted session row, written via new CRUD methods
+`mark_target_given_up`/`mark_forced_topic_spent` — needed because the
+analysis worker's task, not this class, now computes the candidate queue,
+and the two tasks must see consistent state. The three writes that affect
+the very next candidate-queue computation
+(`mark_target_given_up`/`mark_forced_topic_spent`/the `UNABLE_TO_ANSWER`
+`field_completeness` patch) are awaited immediately, before the flush,
+rather than deferred like the purely-bookkeeping `record_round_answer`/
+`close_round` writes — a deliberate correction over an earlier draft that
+would have raced the flush-triggered combined call. `pipeline.py`'s
+`on_speaking_change` no longer fans out to
+`orchestrator.enqueue_speaking_state` (deleted along with the batched
+completeness worker it fed — see
+[backend/completeness-pipeline.md](completeness-pipeline.md)). Older
+history predating this rewrite described the deleted free-target-selection/
+fused-per-answer-call design in detail and has been removed from this file;
+`docs/qa-flow-redesign-understanding.md` has the full design trail.)

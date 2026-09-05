@@ -71,9 +71,9 @@ class ResumeRoomCRUD(Protocol):
         cannot re-derive because it only ever sees resume_data. Also folds
         llm_usage into the running cost accumulator the same way
         apply_resume_update does. Committed unconditionally the instant it's
-        called — the caller (silence_completeness_worker) is responsible for
-        only calling this once a result is final and should not be
-        discarded."""
+        called — the caller (the analysis worker's combined-chain batch) is
+        responsible for only calling this once a result is final and should
+        not be discarded."""
         ...
 
     async def start_round(
@@ -146,7 +146,7 @@ class ResumeRoomCRUD(Protocol):
         session_id: str,
         round_id: str,
         *,
-        grade: str,
+        grade: Optional[str],
         llm_usage: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Terminal write for a round: sets status="closed", stamps `grade`
@@ -154,9 +154,56 @@ class ResumeRoomCRUD(Protocol):
         this round was still the active one. Folds llm_usage into the
         running cost accumulator the same way every other committing method
         does. Committed unconditionally, same semantics as
-        apply_field_completeness."""
+        apply_field_completeness. `grade` is `None` for the opening round,
+        which is never graded (a multi-block opener has no single
+        complete_when bar) -- every other round passes one of
+        question_chain's ANSWER_GRADE_* values."""
         ...
 
+
+    async def apply_question_queue(self, session_id: str, queue: List[Dict[str, Any]]) -> None:
+        """Wholesale-overwrites questions.queue with the freshly regenerated
+        candidate list from the combined analysis call. Never patched
+        incrementally -- every cycle recomputes the whole thing fresh, so
+        this always replaces rather than merges. Committed unconditionally;
+        the caller is responsible for only calling this when the combined
+        call actually returned a queue (not None -- see combined_chain's
+        fail-soft contract, where None means "call failed, leave the
+        persisted queue untouched" and must never reach this method)."""
+        ...
+
+    async def pop_question_queue_head(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically pops and returns questions.queue[0] (None if the queue
+        is empty or the session doesn't exist). The only queue read/write
+        InterviewDirector needs -- the popped item's question text is
+        already fully worded by the combined call, so no further LLM call
+        is needed to ask it."""
+        ...
+
+    async def mark_target_given_up(self, session_id: str, block: str, item_id: Optional[str]) -> None:
+        """Adds this target's gap_key to questions.given_up_targets
+        (no-op if already present). Persisted equivalent of the old
+        in-memory _organic_targets_given_up set -- needed now because
+        candidate-queue regeneration runs in a different asyncio task
+        (the analysis worker) than the one that decided to give up on this
+        target (InterviewDirector), so the exclusion must be visible
+        cross-task via the session row rather than an instance attribute."""
+        ...
+
+    async def mark_forced_topic_spent(self, session_id: str, key: str) -> None:
+        """Adds `key` (a "conflict:<id>" or "unresolved:<id>" candidate key)
+        to questions.forced_topics_spent (no-op if already present).
+        Persisted equivalent of the old in-memory _forced_topics_spent set,
+        for the same cross-task-visibility reason as mark_target_given_up."""
+        ...
+
+    async def mark_more_items_checked(self, session_id: str, blocks: List[str]) -> None:
+        """Adds each block name in `blocks` to questions.more_items_checked
+        (no-op for any already present). Persisted so the combined call's
+        "do you have any other X?" side-question, once asked for a
+        single-item repeatable block, is not asked again on a later cycle
+        for the same block."""
+        ...
 
     async def mark_finished(self, session_id: str, status: str, error: Optional[str] = None) -> None:
         """Transition an active session to a terminal status, no-op if already terminal."""

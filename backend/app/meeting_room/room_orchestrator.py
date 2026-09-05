@@ -20,10 +20,8 @@ from app.meeting_room.daily.runtime import ensure_daily_runtime
 from app.meeting_room.models import StartSessionResponse, StopSessionResponse
 from app.meeting_room.resume_analysis_pipeline.analysis_orchestrator import (
     FlushRequest,
-    cancel_grading_tasks,
     run_resume_analysis_worker,
 )
-from app.meeting_room.resume_analysis_pipeline.silence_completeness_worker import run_silence_completeness_worker
 
 
 class ResumeRoomOrchestrator:
@@ -34,7 +32,6 @@ class ResumeRoomOrchestrator:
         self._daily: Optional[DailyClient] = None
         self._tasks: Dict[str, asyncio.Task] = {}
         self._queues: Dict[str, "asyncio.Queue[Optional[str]]"] = {}
-        self._speaking_queues: Dict[str, "asyncio.Queue[Optional[bool]]"] = {}
 
 
     def enqueue_transcript(self, session_id: str, text: str) -> None:
@@ -47,43 +44,42 @@ class ResumeRoomOrchestrator:
             pass
 
 
-    async def flush_transcript(self, session_id: str, *, wait: bool = True) -> None:
+    async def flush_transcript(self, session_id: str, *, wait: bool = True) -> Optional[FlushRequest]:
         """Force whatever's accumulated on the transcript queue through one
-        extraction batch, out of turn with the char-count trigger.
+        extraction batch, out of turn with the char-count trigger. Returns
+        the `FlushRequest` itself (or `None` if the session's queue is
+        already gone) so a caller that passed `wait=False` can still await
+        `request.done` later, on demand, instead of never being able to
+        observe completion at all.
 
         `wait=False` still enqueues the FlushRequest (so extraction runs
         promptly instead of waiting for the char trigger) but returns
         immediately instead of blocking the caller on that batch's LLM call.
         Callers that don't need a just-landed, verified resume_data read
-        (see InterviewDirector._open_next_target) use this to keep a full
-        extraction round trip off the interview turn's critical path.
+        (see InterviewDirector._finish_answer) use this to keep a full
+        extraction round trip off the interview turn's critical path --
+        `InterviewDirector._advance_from_queue` holds onto the returned
+        request and only falls back to awaiting it if popping the queue
+        immediately comes back empty, so the common case (queue already has
+        a worded question) never pays this latency at all.
         """
         queue = self._queues.get(session_id)
         if queue is None:
-            return
+            return None
         request = FlushRequest()
         try:
             queue.put_nowait(request)
         except asyncio.QueueFull:
-            return
+            return None
         if not wait:
-            return
+            return request
         try:
             await asyncio.wait_for(
                 request.done.wait(), timeout=settings.resume_room_flush_timeout_seconds
             )
         except asyncio.TimeoutError:
             pass
-
-
-    def enqueue_speaking_state(self, session_id: str, is_speaking: bool) -> None:
-        queue = self._speaking_queues.get(session_id)
-        if queue is None:
-            return
-        try:
-            queue.put_nowait(is_speaking)
-        except asyncio.QueueFull:
-            pass
+        return request
 
 
     def _get_daily(self) -> DailyClient:
@@ -131,13 +127,6 @@ class ResumeRoomOrchestrator:
             except asyncio.QueueFull:
                 pass
 
-        speaking_queue = self._speaking_queues.get(session_id)
-        if speaking_queue is not None:
-            try:
-                speaking_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-
         status = STATUS_ENDED
         error: Optional[str] = None
 
@@ -180,22 +169,6 @@ class ResumeRoomOrchestrator:
             except Exception:
                 pass
         self._queues.pop(session_id, None)
-
-        # Post-extraction grading tasks spawned by analysis_orchestrator._run_batch
-        # aren't tracked in self._tasks (they're fire-and-forget, off the
-        # analysis worker's own await chain) -- cancel them explicitly so
-        # none linger past teardown writing into a now-finished session.
-        cancel_grading_tasks(session_id)
-
-        completeness_task = self._tasks.pop(f"completeness_{session_id}", None)
-        if completeness_task is not None:
-            try:
-                await asyncio.wait_for(completeness_task, timeout=30)
-            except asyncio.TimeoutError:
-                completeness_task.cancel()
-            except Exception:
-                pass
-        self._speaking_queues.pop(session_id, None)
 
 
     async def start_session(self) -> StartSessionResponse:
@@ -253,17 +226,6 @@ class ResumeRoomOrchestrator:
 
         self._tasks[f"analysis_{session_id}"] = analysis_task
 
-        self._speaking_queues[session_id] = asyncio.Queue(maxsize=1000)
-
-        completeness_task = asyncio.create_task(
-            run_silence_completeness_worker(
-                session_id, self._crud, self._speaking_queues[session_id], self
-            ),
-            name=f"resume-completeness-{session_id}"
-        )
-
-        self._tasks[f"completeness_{session_id}"] = completeness_task
-
         try:
             ensure_daily_runtime()
             bot_task = asyncio.create_task(
@@ -297,24 +259,7 @@ class ResumeRoomOrchestrator:
                     leaked_analysis_task.cancel()
                 except Exception:
                     pass
-            cancel_grading_tasks(session_id)
             self._queues.pop(session_id, None)
-
-            speaking_queue = self._speaking_queues.get(session_id)
-            if speaking_queue is not None:
-                try:
-                    speaking_queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-            leaked_completeness_task = self._tasks.pop(f"completeness_{session_id}", None)
-            if leaked_completeness_task is not None:
-                try:
-                    await asyncio.wait_for(leaked_completeness_task, timeout=30)
-                except asyncio.TimeoutError:
-                    leaked_completeness_task.cancel()
-                except Exception:
-                    pass
-            self._speaking_queues.pop(session_id, None)
 
             raise HTTPException(
                 status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,

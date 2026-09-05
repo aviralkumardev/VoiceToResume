@@ -158,58 +158,90 @@ The two big structural changes vs. today:
    only ever grades + (if PARTIAL) probes. All "what's next and how do I
    word it" work moves to the buffer-processing call and its queue.
 
-## 4. Open questions / assumptions before I plan implementation
+## 4. Decisions locked in so far
 
-1. **Does the independent 2s-silence whole-resume grading sweep
-   (`silence_completeness_worker`'s own debounce, separate from the answer-
-   end flush) survive in the new design, or is it fully replaced by the
-   char-triggered combined call + the answer-end flush?** Point (2)/(3) only
-   describe a char-based trigger and an answer-end flush — I don't see a
-   third, independent silence-debounce trigger mentioned, so my working
-   assumption is **it's gone, folded into the char-triggered call**. Please
-   confirm.
-2. **Does the combined call in (2) still receive a Python-precomputed
-   priority-ordered candidate list (à la `compute_next_targets`), or does it
-   decide priority order itself from the raw resume + rubric each time?**
-   "What stays the same: priority ordering" reads to me as *the rule* stays
-   the same, but I want to confirm whether Python keeps computing/feeding the
-   candidate list (cheaper, more deterministic, matches today's trust-
-   boundary pattern) versus the LLM re-deriving order from scratch each call.
-3. **What exactly is "the queue"?** Is it a list of already-**worded**
-   questions ready to speak (so popping it never needs another LLM call), or
-   a list of **targets** (block/item/fields) that still need a wording step
-   before being asked? Point (5) ("pick the first question from the queue")
-   reads as pre-worded to me, but I want that confirmed since it affects
-   whether popping the queue can ever be a zero-latency operation or not.
-4. **Does the buffer-process call (2)/(a) get access to the in-progress
-   answer's transcript before the candidate finishes speaking**, i.e. is the
-   100-char trigger evaluated against the *whole* running transcript
-   (mid-answer included, same as today's extraction trigger, which fires
-   "however long the candidate keeps talking, not just once they go
-   silent"), or only against completed answers? I'm assuming the former
-   (matches today's behavior) — flag if not.
-5. **Forced conflict/unresolved topics** — today these jump the queue ahead
-   of whatever the per-answer call drafted, decided by
-   `InterviewDirector._pick_forced_topic` reading `resume["conflicts"]`/
-   `resume["unresolved"]` directly, worded by a small dedicated chain
-   (`run_topic_question_chain`), independent of the per-answer grading call.
-   I'm assuming this guardrail is unchanged and just now jumps the new
-   *queue* instead of overriding a per-turn `next_question` — confirm this
-   still holds, since it isn't mentioned in your 6 points.
-6. **`UNABLE_TO_ANSWER`** — today an explicit decline is a third possible
-   grade (not just PARTIAL/SUFFICIENT), and closes the round while
-   patching `field_completeness` directly for the declined field(s)
-   (`build_unable_to_answer_patch`) since the batched grader can structurally
-   never infer a decline on its own. Your 6 points only mention
-   PARTIAL/SUFFICIENT outcomes for step (b) — I'm assuming
-   `UNABLE_TO_ANSWER` still exists as a third grade and is treated like
-   SUFFICIENT for queue-advancement purposes (move on), just with that same
-   `field_completeness` patch on the side. Confirm.
-7. **Round/probe budget** — today a "round" caps at
-   `resume_room_max_questions_per_round` (default 2) exchanges before being
-   force-closed even if still non-terminal (`_organic_targets_given_up`
-   guards against re-queueing a subject that capped out non-terminal). Does
-   this cap still apply per queue item in the new design?
+- **Priority ordering — belt and suspenders, both ends agree.** Python keeps
+  computing the deterministic priority-ordered candidate list (adapted from
+  today's `compute_next_targets`: touched blocks before untouched, each by
+  `objective_priority`) and hands it to the combined call in that order. The
+  combined call is *also* explicitly instructed (prompt-level) to preserve
+  that given order when it decides which candidates are resolved and words
+  the rest into the queue — it's not free to reorder. Python then validates
+  the returned queue's order/containment against the list it handed in
+  (same trust-boundary shape as today's `question_chain._validate_next_target`
+  — cheap containment/order check against a small Python-built list) and
+  corrects it if the LLM's output ever drifts. Two independent things have
+  to agree before an order ships, which is exactly the safety margin that
+  was missing when the earlier free-choice design bounced between blocks
+  live.
+- **Queue regenerated wholesale every cycle**, not patched incrementally.
+  Cheap with only 6-7 blocks, and avoids an entire class of staleness/
+  reconciliation bugs (mirrors the existing "replace, don't append" rule for
+  the final-resolution pass's array fields — see
+  `resume-analysis-pipeline.md`'s gotcha on why patching broke there).
+- **The queue is visible in the debug JSON export.** Same place/pattern as
+  today's `questions` ledger and `field_completeness` dump — the combined
+  call's output (the regenerated queue, in priority order, each entry's
+  target + worded question) gets written into `backend/json/{session_id}.json`
+  (or a sibling file, mirroring `_status.json`) on every update, purely for
+  observability into what the pipeline is planning to ask next.
+- **The independent 2s-silence whole-resume grading sweep is gone
+  entirely.** Confirmed — there is no third, standalone silence-debounce
+  trigger any more. The only two triggers left are: the ~100-char buffer
+  threshold (fires mid-answer, while the candidate is still talking) and
+  "answer complete" (the same silence-debounce mechanism as today, but its
+  only job now is detecting that the candidate has stopped talking so the
+  answer can be graded/probed/advanced — it no longer independently drives a
+  whole-resume re-grade of its own). `silence_completeness_worker.py` as a
+  standalone passive sweep is superseded; whatever of it survives is folded
+  into the buffer-process call triggered by (2)/(a).
+- **The 100-char buffer trigger fires mid-answer, same as today's
+  extraction trigger.** Confirmed — the buffer is just whatever the
+  candidate has said so far, so it naturally fills and fires while they're
+  still mid-answer, not only once they go silent. No special-casing needed
+  to make this happen; it falls out of "the buffer is fed by the transcript
+  as it arrives," same as today's `resume_room_extraction_trigger_chars`
+  behavior.
+- **`UNABLE_TO_ANSWER` still exists as a third grade and is treated like
+  SUFFICIENT for queue-advancement.** Confirmed — an explicit decline (not
+  just PARTIAL/SUFFICIENT) still ends the round and moves on to await (a) +
+  pop the queue, same branch as SUFFICIENT, just with the extra
+  `field_completeness` patch on the side for the declined field(s) (today's
+  `build_unable_to_answer_patch`) since the combined call can structurally
+  never infer a verbal decline from `resume_data` alone.
+- **The round/probe budget concept carries over unchanged.** A "round" is
+  still one target (one queue item), and it's still allowed to stay open
+  across multiple PARTIAL grades — probing deeper into the *same* target
+  even when successive probes address different fields within that same
+  target block (exactly like today's "consolidate, don't drip-feed" +
+  multi-field `target.fields` shape). The budget
+  (`resume_room_max_questions_per_round`, today default 2: opening question
+  + 1 follow-up) still caps the total number of question exchanges spent on
+  one target before it's force-closed even if still non-terminal — this is
+  what bounds "how deep can we probe" and "how many times can we re-ask
+  about the same block." A target that caps out non-terminal still needs
+  the equivalent of today's `_organic_targets_given_up` guard, so the queue
+  regeneration doesn't just hand the same stuck target right back as
+  top-priority next cycle.
+- **Conflicts/unresolved records still outrank every ordinary gap, but
+  there's no separate dedicated wording call for them any more.** Priority
+  is unchanged — Python still checks `resume["conflicts"]` then
+  `resume["unresolved"]` first and places any outstanding, not-yet-forced
+  record at the very front of the candidate list, ahead of every
+  objective-priority-ordered gap. What's different from today: there's no
+  more standalone `run_topic_question_chain` call. The **same** combined
+  call that words ordinary queue questions also words these — it's handed
+  the conflict/unresolved records at the front of its candidate list (same
+  as any other candidate) and produces the worded question for them in the
+  same response as everything else. One mechanism (the combined call +
+  regenerated queue) now covers both cases instead of a queue plus a
+  separate guardrail chain on top. The "mark as spent once forced" bookkeeping
+  (so the same conflict/unresolved id doesn't force the identical question
+  again next cycle before extraction has caught up to clearing the record)
+  still applies, same as today's `_forced_topics_spent`.
 
-I'll hold off on any code changes or an implementation plan until these are
-resolved.
+## 5. Status: no more open questions
+
+Every open item from the earlier rounds is now resolved (see "Decisions
+locked in" above). Next step, when you're ready, is turning this into an
+actual implementation plan.

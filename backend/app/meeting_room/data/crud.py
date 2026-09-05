@@ -22,6 +22,7 @@ from app.meeting_room.resume_analysis_pipeline.merge import (
     merge_updates,
     remove_unresolved,
 )
+from app.meeting_room.resume_analysis_pipeline.next_target import gap_key
 
 JSON_EXPORT_DIR = Path(__file__).resolve().parents[3]/"json"
 
@@ -145,6 +146,11 @@ class InMemoryResumeRoomCRUD:
                 "awaiting_answer": False,
                 "round_order": [],
                 "rounds": {},
+                "queue": [],
+                "given_up_targets": [],
+                "forced_topics_spent": [],
+                "last_asked_question": None,
+                "more_items_checked": [],
             },
             "final_pass_completed": False,
             "llm_cost": {
@@ -347,6 +353,7 @@ class InMemoryResumeRoomCRUD:
             questions["round_order"].append(round_id)
             questions["current_round_id"] = round_id
             questions["awaiting_answer"] = True
+            questions["last_asked_question"] = question_text
 
             self._schedule_write(session_id, row)
             return round_id
@@ -382,6 +389,7 @@ class InMemoryResumeRoomCRUD:
             })
             questions["current_round_id"] = round_id
             questions["awaiting_answer"] = True
+            questions["last_asked_question"] = question_text
             self._schedule_write(session_id, row)
 
 
@@ -422,7 +430,7 @@ class InMemoryResumeRoomCRUD:
         session_id: str,
         round_id: str,
         *,
-        grade: str,
+        grade: Optional[str],
         llm_usage: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Terminal write for one round: stamps its grade and closed_at, and
@@ -447,6 +455,82 @@ class InMemoryResumeRoomCRUD:
 
             self._fold_llm_usage(row, llm_usage)
             self._schedule_write(session_id, row)
+
+
+    async def apply_question_queue(self, session_id: str, queue: List[Dict[str, Any]]) -> None:
+        """Wholesale-overwrites questions.queue -- never patched
+        incrementally, matching the "regenerate wholesale every cycle"
+        design. Caller (analysis_orchestrator._run_batch) is responsible for
+        only calling this when the combined call actually returned a queue
+        (not None -- see combined_chain's fail-soft contract)."""
+        async with self._lock:
+            row = self._sessions.get(session_id)
+            if row is None:
+                return
+            row["questions"]["queue"] = queue
+            self._schedule_write(session_id, row)
+
+
+    async def pop_question_queue_head(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically pops and returns questions.queue[0] (None if the queue
+        is empty or the session doesn't exist). The question text on the
+        popped item is already fully worded by the combined call -- no
+        further LLM call is needed to ask it."""
+        async with self._lock:
+            row = self._sessions.get(session_id)
+            if row is None:
+                return None
+            queue = row["questions"]["queue"]
+            if not queue:
+                return None
+            item = queue.pop(0)
+            self._schedule_write(session_id, row)
+            return item
+
+
+    async def mark_target_given_up(self, session_id: str, block: str, item_id: Optional[str]) -> None:
+        async with self._lock:
+            row = self._sessions.get(session_id)
+            if row is None:
+                return
+            key = gap_key(block, item_id)
+            given_up = row["questions"]["given_up_targets"]
+            if key not in given_up:
+                given_up.append(key)
+                self._schedule_write(session_id, row)
+
+
+    async def mark_forced_topic_spent(self, session_id: str, key: str) -> None:
+        async with self._lock:
+            row = self._sessions.get(session_id)
+            if row is None:
+                return
+            spent = row["questions"]["forced_topics_spent"]
+            if key not in spent:
+                spent.append(key)
+                self._schedule_write(session_id, row)
+
+
+    async def mark_more_items_checked(self, session_id: str, blocks: List[str]) -> None:
+        """Adds each block name in `blocks` to questions.more_items_checked
+        (no-op for any already present). This is what stops the combined
+        call's "do you have any other X?" side-question from being asked
+        again on a later cycle for a block it's already been asked for once
+        -- see combined_prompts.SYSTEM_PROMPT's once-per-section rule."""
+        async with self._lock:
+            row = self._sessions.get(session_id)
+            if row is None:
+                return
+            if not blocks:
+                return
+            checked = row["questions"]["more_items_checked"]
+            changed = False
+            for block in blocks:
+                if block not in checked:
+                    checked.append(block)
+                    changed = True
+            if changed:
+                self._schedule_write(session_id, row)
 
 
     async def mark_finished(self, session_id: str, status: str, error: Optional[str] = None) -> None:

@@ -36,26 +36,29 @@ STT → `InterviewDirector` → TTS → back to Daily, where `InterviewDirector`
 picks fixed or LLM-worded question text but never free-generates a reply.
 The session opens on a fixed greeting/opening question and closes on a fixed
 closing line once every gap is covered. Every candidate transcript line is
-also queued into the resume-analysis pipeline, which periodically calls an
-LLM to merge structured updates into that session's resume document; every
-VAD start/stop event drives the completeness pipeline, which — after 2s of
-silence — grades that resume document against a coverage rubric, cancelling
-the grading call outright if the candidate resumes speaking before it
-finishes.
+also queued into the resume-analysis pipeline, which — on a ~100-char buffer
+trigger and at every answer-end — makes **one combined background LLM
+call** that extracts structured updates into the resume document, grades
+that resume's completeness against a coverage rubric, and regenerates the
+entire upcoming-question queue (already fully worded) in the same response.
+Priority ordering across that queue (outstanding conflicts/ambiguities
+first, then coverage gaps by importance) is computed deterministically in
+Python and handed to the model to preserve, then re-validated/re-sorted
+after the call returns — not left to the model's free choice, after an
+earlier free-choice design was observed bouncing between topics live.
 
 The whole session is **interview mode** — a round-based Q&A loop, not a
 free-flowing chat: each round is spoken *straight through TTS* (never
-interrupted by the candidate resuming speech), and once silence ends the
-answer, a single LLM call grades it and freely drafts both a same-topic
-probe and a genuinely different next question in one response — no
-backend-side target selection. Two small deterministic guardrails sit on
-top: an outstanding conflicting/ambiguous fact in the resume always jumps
-the queue ahead of whatever question was organically drafted, and the
-interview is never allowed to end while a required coverage block is still
-missing, generating one more question for it instead. If the candidate
-instead asks a process/doubt question about the interview itself, that's
-detected on the same grading call, answered directly via TTS, and the
-original pending question is re-spoken before waiting again.
+interrupted by the candidate resuming speech). Once silence ends an answer,
+a second, much narrower LLM call grades only that answer against its own
+round's completion bar and drafts a same-topic probe if it's still open —
+it has no say over what gets asked next at all. `InterviewDirector` simply
+pops the next already-worded question off the Python-ordered queue once a
+round closes; there is no per-turn "what should we ask next" LLM call. If
+the candidate instead asks a process/doubt question about the interview
+itself, that's detected on the same narrow grading call, answered directly
+via TTS, and the original pending question is re-spoken before waiting
+again.
 
 ## The Map
 
@@ -66,9 +69,9 @@ original pending question is re-spoken before waiting again.
 | backend/room-orchestration.md | Room orchestration | Session lifecycle, task/queue tracking, teardown |
 | backend/external-daily.md | Daily.co integration | Room/token creation, native runtime init |
 | backend/database-models.md | Session data / CRUD | In-memory session store, debug JSON export |
-| backend/stt-tts-pipeline.md | Voice bot pipeline | pipecat STT→TTS pipeline (no chat LLM), caption/speaking bridges, InterviewDirector (opening/closing/meta-question handling) |
-| backend/resume-analysis-pipeline.md | Resume analysis pipeline | Transcript batching, extraction/final-resolution LLM chains, merge logic |
-| backend/completeness-pipeline.md | Completeness grading & interview mode | Coverage-rubric grading (batched sweep), fused per-answer LLM grading, forced-topic/required-gap guardrails |
+| backend/stt-tts-pipeline.md | Voice bot pipeline | pipecat STT→TTS pipeline (no chat LLM), caption/speaking bridges, InterviewDirector (round state machine, queue-popping, opening/closing/meta-question handling) |
+| backend/resume-analysis-pipeline.md | Resume analysis pipeline | Transcript batching, the combined extraction+grading+queue-wording LLM call, narrow per-answer grading chain, final-resolution chain, merge logic |
+| backend/completeness-pipeline.md | Completeness grading & interview mode | Coverage-rubric grading helpers, Python-authoritative candidate-queue priority ordering, `UNABLE_TO_ANSWER` patching |
 | backend/llm-providers.md | LLM provider abstraction | Provider interface/factory, OpenRouter implementation, JSON schema validation |
 | frontend/routing-app-shell.md | App shell & routing | Single-page app state, `DailyProvider` wiring |
 | frontend/api-client.md | API client | `startResumeRoomSession`, `stopResumeRoomSession` |

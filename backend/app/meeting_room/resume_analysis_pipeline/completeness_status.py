@@ -97,7 +97,16 @@ def _prune_atomic_block(resume, block, prev_block, already_decided, to_judge):
     value = _array_value(resume.get(block))
 
     if value is None:
-        already_decided[block] = _carry_unavailable(prev_block) or dict(_MISSING_LEAF)
+        carried = _carry_unavailable(prev_block)
+        if carried is not None:
+            already_decided[block] = carried
+            return
+        # Still open (never terminal) -- keep showing it to JOB 2 every cycle
+        # instead of short-circuiting straight to MISSING, so an explicit
+        # "I don't have any X" declaration made anywhere in the transcript
+        # (not just inside a targeted round about this block) has a chance
+        # to be caught. See combined_prompts.py JOB 2's UNABLE_TO_ANSWER verdict.
+        to_judge[block] = {"value": []}
         return
 
     if _is_sufficient(prev_block):
@@ -113,7 +122,13 @@ def _prune_singular_block(resume, block, spec, prev_block, already_decided, to_j
     prev_fields = (prev_block or {}).get("fields", {})
 
     if not any(_scalar_value(target.get(field)) for field in spec["fields"]):
-        already_decided[block] = _carry_unavailable(prev_block) or dict(_MISSING_LEAF)
+        carried = _carry_unavailable(prev_block)
+        if carried is not None:
+            already_decided[block] = carried
+            return
+        # Still open -- see _prune_atomic_block for why this no longer
+        # short-circuits to MISSING unconditionally.
+        to_judge[block] = {"fields_to_judge": {}, "missing_fields": list(spec["fields"])}
         return
 
     needs_verdict, context_only, decided_fields, missing_names = {}, {}, {}, []
@@ -151,7 +166,13 @@ def _prune_list_object_block(resume, block, spec, prev_block, already_decided, t
     """List-object blocks: experience, education, projects, certifications, courses."""
     items: List[Dict[str, Any]] = resume.get(block) or []
     if not items:
-        already_decided[block] = _carry_unavailable(prev_block) or dict(_MISSING_LEAF)
+        carried = _carry_unavailable(prev_block)
+        if carried is not None:
+            already_decided[block] = carried
+            return
+        # Still open -- see _prune_atomic_block for why this no longer
+        # short-circuits to MISSING unconditionally.
+        to_judge[block] = {"items_to_judge": []}
         return
 
     field_specs = spec.get("fields", {})
@@ -272,8 +293,53 @@ def merge_completeness(
             if merged_items:
                 node["items"] = merged_items
 
+        if block_kind(block) == "list_object" and node.get("items"):
+            node = _recompute_list_object_status(node, coverage.get(block, {}).get("fields") or {})
+
         result[block] = node
     return result
+
+
+def _recompute_list_object_status(node: Dict[str, Any], field_specs: Dict[str, Any]) -> Dict[str, Any]:
+    """Overrides a list-object block's own top-level `completeness_status`
+    with a Python-derived verdict, mirroring `next_target._item_level_target`'s
+    own per-item exclusion rule exactly: SUFFICIENT only once EVERY existing
+    item has no open field left (every one of `field_specs` resolved --
+    filled in, explicitly declined, or given up on after the per-round
+    question cap), PARTIAL otherwise.
+
+    The LLM's own holistic verdict for these blocks used a looser "at least
+    one item is good enough" bar (see `coverage_schema.py`'s old wording),
+    which meant the label could say SUFFICIENT while another item still had
+    fields the interview would go on to skip asking about entirely, since
+    `next_target.py` used to trust this same label to decide whether the
+    whole block was worth looking at. Deriving it here in Python instead
+    keeps the label truthful and in permanent lockstep with what
+    `next_target.py` actually does, rather than depending on the model's
+    aggregate judgment matching a mechanical per-field rule it's never
+    perfectly reliable at applying consistently across every item.
+
+    A pure re-labeling function: never touches `node["items"]` itself, and
+    is only ever called when `node["items"]` is non-empty (an empty-items
+    block's status is JOB 2's own call to make -- including a legitimate
+    UNABLE_TO_ANSWER for a spontaneous whole-block decline).
+    """
+    items = node["items"]
+    all_terminal = all(
+        (item.get("fields") or {}).get(field, {}).get("completeness_status") in TERMINAL_STATUSES
+        for item in items
+        for field in field_specs
+    )
+    node = dict(node)
+    if all_terminal:
+        node["completeness_status"] = STATUS_SUFFICIENT
+        node["reason"] = "every captured item has no open field left"
+        node["confidence"] = 1.0
+    else:
+        node["completeness_status"] = STATUS_PARTIAL
+        node["reason"] = "at least one captured item still has an open field"
+        node["confidence"] = 1.0
+    return node
 
 
 def _as_leaf_map(fields: Any) -> Dict[str, Any]:
@@ -417,8 +483,7 @@ def build_unable_to_answer_patch(
     `prune_for_judgment` has nothing to ever judge). `target` is
     `{"block", "item_id", "fields"}` (`item_id` optional, `fields` an
     optional list) -- see `InterviewDirector._open_round`/`_finish_answer`
-    and `question_chain._validate_next_target` for how it's produced. A
-    single declined question
+    for how it's produced. A single declined question
     commonly names several fields at once (Round 3's "consolidate, don't
     drip-feed" rule), so every field in the list is committed in one patch,
     not just the first.

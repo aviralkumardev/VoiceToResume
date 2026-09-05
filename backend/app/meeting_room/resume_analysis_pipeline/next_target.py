@@ -1,8 +1,9 @@
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from app.meeting_room.resume_analysis_pipeline.completeness_status import TERMINAL_STATUSES
 from app.meeting_room.resume_analysis_pipeline.config_jsons_definitions.coverage_schema import (
     askable_coverage_schema,
+    complete_when_for_target,
 )
 
 ExcludeKey = Tuple[str, Optional[str]]
@@ -56,6 +57,32 @@ def _item_level_target(
     return None
 
 
+def _block_is_open(
+    resume: Dict[str, Any], field_completeness: Dict[str, Any], block: str, spec: Dict[str, Any]
+) -> bool:
+    """Whether `block` might still have something worth asking about.
+
+    A list-object block with existing items (`"fields" in spec` and
+    `resume[block]` non-empty -- experience/education/projects/
+    certifications/courses) is always considered open here: each item gets
+    its own separate question thread, so the block's own aggregate verdict
+    (e.g. SUFFICIENT because ONE item already cleared a loose "at least one
+    is enough" bar) must never hide every OTHER item's still-open fields.
+    `_item_level_target` itself is what actually decides there's nothing
+    left, once every existing item has no open field of its own remaining
+    (filled in, explicitly declined, or given up on after hitting the
+    per-round question cap) -- this predicate only controls whether it gets
+    a chance to look. A block with no items yet, or with no item breakdown
+    at all (skills, achievements, awards, languages,
+    additional_information), has no item-level granularity to fall back on
+    and keeps using the block's own aggregate `completeness_status` exactly
+    as before.
+    """
+    if "fields" in spec and resume.get(block):
+        return True
+    return _block_status(field_completeness, block) not in TERMINAL_STATUSES
+
+
 def compute_next_targets(
     resume: Dict[str, Any],
     coverage: Dict[str, Any],
@@ -94,7 +121,7 @@ def compute_next_targets(
     open_blocks = [
         (block, spec)
         for block, spec in askable.items()
-        if _block_status(field_completeness, block) not in TERMINAL_STATUSES
+        if _block_is_open(resume, field_completeness, block, spec)
     ]
     touched = sorted(
         (entry for entry in open_blocks if resume.get(entry[0])),
@@ -115,3 +142,111 @@ def compute_next_targets(
             targets.append(target)
 
     return targets
+
+
+def gap_key(block: str, item_id: Optional[str]) -> str:
+    """Stable identity for an ordinary coverage-gap candidate -- used by
+    `mark_target_given_up`/`compute_candidate_queue` to exclude a
+    given-up-on target from every later cycle."""
+    return f"gap:{block}:{item_id or ''}"
+
+
+def _parse_gap_key(key: str) -> Optional[ExcludeKey]:
+    if not key.startswith("gap:"):
+        return None
+    rest = key[len("gap:"):]
+    block, _, item_id = rest.partition(":")
+    return block, (item_id or None)
+
+
+def compute_candidate_queue(
+    resume: Dict[str, Any],
+    coverage: Dict[str, Any],
+    field_completeness: Dict[str, Any],
+    *,
+    excluded_keys: FrozenSet[str] = frozenset(),
+) -> List[Dict[str, Any]]:
+    """The full ordered candidate list handed to `combined_chain.run_combined_chain`:
+    outstanding conflicts (insertion order) -> outstanding unresolved records
+    (insertion order) -> ordinary coverage gaps (`compute_next_targets`,
+    unchanged priority order). This is Python's authoritative priority
+    ordering -- the combined call is instructed to preserve it, and its
+    response is re-sorted back to this exact order before being trusted (see
+    `combined_chain._validate_queue`).
+
+    This is the new home for what `InterviewDirector._pick_forced_topic` used
+    to do, moved here because candidate-list computation now runs from the
+    analysis-worker task (`analysis_orchestrator._run_batch`) once per
+    combined-call cycle, rather than from `InterviewDirector`, which no
+    longer picks targets at all -- it only pops already-worded questions off
+    the queue this function produced.
+
+    `excluded_keys` is every candidate key to leave out entirely: the round
+    currently open (so it isn't reselected as its own successor), any
+    target a prior round gave up on, and any forced topic already given its
+    one round this session (`questions.given_up_targets` /
+    `questions.forced_topics_spent` -- see `data/crud.py`'s
+    `mark_target_given_up`/`mark_forced_topic_spent`).
+
+    Each candidate: `{"kind": "conflict"|"unresolved"|"gap", "key", "block",
+    "item_id", "fields", "complete_when"}`, plus the raw resume record under
+    `"record"` for `kind != "gap"` -- everything the combined call needs to
+    word a question without a separate topic-wording call.
+    """
+    candidates: List[Dict[str, Any]] = []
+
+    for record in resume.get("conflicts") or []:
+        record_id = record.get("id")
+        if not record_id:
+            continue
+        key = f"conflict:{record_id}"
+        if key in excluded_keys:
+            continue
+        field = record.get("field")
+        candidates.append({
+            "kind": "conflict",
+            "key": key,
+            "block": record.get("block"),
+            "item_id": record.get("item_id"),
+            "fields": [field] if field else None,
+            "complete_when": None,
+            "record": record,
+        })
+
+    for record in resume.get("unresolved") or []:
+        record_id = record.get("id")
+        if not record_id:
+            continue
+        key = f"unresolved:{record_id}"
+        if key in excluded_keys:
+            continue
+        candidates.append({
+            "kind": "unresolved",
+            "key": key,
+            "block": record.get("block"),
+            "item_id": None,
+            "fields": None,
+            "complete_when": None,
+            "record": record,
+        })
+
+    gap_exclude: Set[ExcludeKey] = set()
+    for key in excluded_keys:
+        parsed = _parse_gap_key(key)
+        if parsed is not None:
+            gap_exclude.add(parsed)
+
+    for target in compute_next_targets(
+        resume, coverage, field_completeness, exclude_targets=frozenset(gap_exclude),
+    ):
+        block, item_id, fields = target["block"], target.get("item_id"), target.get("fields")
+        candidates.append({
+            "kind": "gap",
+            "key": gap_key(block, item_id),
+            "block": block,
+            "item_id": item_id,
+            "fields": fields,
+            "complete_when": complete_when_for_target(coverage, target),
+        })
+
+    return candidates

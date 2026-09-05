@@ -64,9 +64,13 @@ COVERAGE_SCHEMA: Dict[str, Dict[str, Any]] = {
         "importance": "required",
         "objective_priority": 3,
         "complete_when": (
-            "At least one relevant work experience is sufficiently covered "
-            "(company, role, dates, and real responsibilities) -- it's fine "
-            "if other experience entries are still thin, as long as one is solid."
+            "Every work experience the candidate has named a company for is "
+            "sufficiently covered -- role, dates, and at least 2-3 concrete "
+            "responsibilities or contributions for EACH one, not just restating "
+            "the title or department. A company just introduced mid-answer "
+            "doesn't need to be finished in the same turn, but the section is "
+            "not COMPLETE while any already-named company still has only a "
+            "title and dates with no real responsibilities described."
         ),
         "fields": {
             "company": {
@@ -118,8 +122,12 @@ COVERAGE_SCHEMA: Dict[str, Dict[str, Any]] = {
         "importance": "required",
         "objective_priority": 4,
         "complete_when": (
-            "At least one educational qualification is sufficiently covered "
-            "(degree, field of study, and institution)."
+            "Every educational qualification the candidate has named a degree "
+            "for is sufficiently covered -- degree name, field of study, and "
+            "institution for EACH one. A qualification just introduced "
+            "mid-answer doesn't need to be finished in the same turn, but the "
+            "section is not COMPLETE while any already-named degree still has "
+            "only a degree name with no field of study or institution captured."
         ),
         "fields": {
             "degree": {
@@ -156,8 +164,17 @@ COVERAGE_SCHEMA: Dict[str, Dict[str, Any]] = {
         "importance": "recommended",
         "objective_priority": 6,
         "complete_when": (
-            "At least one project is sufficiently covered -- what it is and "
-            "what the candidate specifically did on it."
+            "Every personal or academic project (outside formal employment) "
+            "the candidate has named is sufficiently covered -- what it is "
+            "(description) and what the candidate specifically did on it "
+            "(responsibilities), for EACH one. Do not count a project "
+            "already captured under a specific job in the experience "
+            "section -- this block is only for the candidate's own "
+            "standalone projects. A project just introduced mid-answer "
+            "doesn't need to be finished in the same turn, but the section "
+            "is not COMPLETE while any already-named standalone project "
+            "still has only a name with no description or no "
+            "responsibilities captured."
         ),
         "fields": {
             "name": {
@@ -283,3 +300,28 @@ def askable_coverage_schema(
 
 
 ASKABLE_COVERAGE_SCHEMA: Dict[str, Dict[str, Any]] = askable_coverage_schema()
+
+
+def complete_when_for_target(coverage: Dict[str, Dict[str, Any]], target: Optional[Dict[str, Any]]) -> Any:
+    """The `complete_when` bar(s) `target` (a round's stored {"block",
+    "item_id", "fields"}) must meet, for the narrow per-answer grading chain
+    -- it grades against only this one target's own bar, never the whole
+    resume/coverage rubric. A whole-block target (`fields` falsy) returns
+    the block's own `complete_when`; a field-scoped target returns the list
+    of the named fields' own `complete_when` strings, falling back to the
+    block's own bar for any field with no dedicated one (blocks with no
+    `fields` breakdown at all, e.g. skills/achievements). `None` if `target`
+    doesn't name a known block (the opening round, which has no single
+    target, never reaches this -- see InterviewDirector._finish_answer)."""
+    block = (target or {}).get("block")
+    spec = coverage.get(block) if block else None
+    if spec is None:
+        return None
+    fields = target.get("fields")
+    if not fields:
+        return spec.get("complete_when")
+    field_specs = spec.get("fields") or {}
+    return [
+        field_specs.get(field, {}).get("complete_when") or spec.get("complete_when")
+        for field in fields
+    ]

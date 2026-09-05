@@ -1,21 +1,27 @@
 import asyncio
-from collections import defaultdict
-from typing import Dict, Optional, Set
-
-from loguru import logger
+from typing import Any, Dict, Optional
 
 from app.core.config import settings
 from app.meeting_room.data.crud_interfaces import ResumeRoomCRUD
-from app.meeting_room.resume_analysis_pipeline.analysis_chain import (run_resume_extraction_chain, run_resume_final_resolution_chain)
-from app.meeting_room.resume_analysis_pipeline.silence_completeness_worker import run_completeness_grading_cycle
+from app.meeting_room.resume_analysis_pipeline.analysis_chain import run_resume_final_resolution_chain
+from app.meeting_room.resume_analysis_pipeline.combined_chain import run_combined_chain
+from app.meeting_room.resume_analysis_pipeline.completeness_status import (
+    merge_completeness,
+    prune_for_judgment,
+)
+from app.meeting_room.resume_analysis_pipeline.config_jsons_definitions.coverage_schema import (
+    ASKABLE_COVERAGE_SCHEMA,
+    COVERAGE_SCHEMA,
+)
+from app.meeting_room.resume_analysis_pipeline.next_target import compute_candidate_queue, gap_key
 
 
 class FlushRequest:
     """Sentinel put on the transcript queue to force whatever's accumulated
-    so far through one extraction batch, out of turn with the char-count
-    trigger. `done` is set once that batch (if any) has landed in
-    resume_data, so a caller can await it instead of reading a stale
-    snapshot -- see ResumeRoomOrchestrator.flush_transcript."""
+    so far through one combined-analysis batch, out of turn with the
+    char-count trigger. `done` is set once that batch (if any) has landed,
+    so a caller can await it instead of reading a stale snapshot -- see
+    ResumeRoomOrchestrator.flush_transcript."""
 
     __slots__ = ("done",)
 
@@ -30,33 +36,22 @@ def _cap_carry(text: str) -> str:
     return text
 
 
-# Fire-and-forget completeness-grading tasks spawned after a batch that
-# changed something, keyed by session_id so they can be cancelled at
-# teardown. Strong refs here are load-bearing -- asyncio does not guarantee
-# keeping an unreferenced task alive. See cancel_grading_tasks below.
-_grading_tasks: Dict[str, Set[asyncio.Task]] = defaultdict(set)
-
-
-def cancel_grading_tasks(session_id: str) -> None:
-    """Cancels and drops any in-flight post-extraction grading tasks for a
-    session. Called from room_orchestrator._close_out so a task doesn't
-    keep running (and eventually write into a gone session) past teardown.
-    """
-    for task in _grading_tasks.pop(session_id, ()):
-        if not task.done():
-            task.cancel()
-
-
-async def _safe_run_completeness_grading_cycle(session_id: str, crud: ResumeRoomCRUD) -> None:
-    """Fail-soft wrapper, matching _safe_run_batch. Nothing awaits this task,
-    so an escaping exception would otherwise surface only as a bare "Task
-    exception was never retrieved" traceback."""
-    try:
-        await run_completeness_grading_cycle(session_id, crud)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("post-extraction completeness grading failed for session {}", session_id)
+def _current_round_key(questions: Dict[str, Any]) -> Optional[str]:
+    """The currently-open round's own candidate key (gap:/conflict:/
+    unresolved:), so it's excluded from this cycle's candidate computation
+    while it's still being asked -- the same exclusion `_finish_answer` used
+    to apply inline before candidate-list computation moved to this worker."""
+    current_round_id = questions.get("current_round_id")
+    if not current_round_id:
+        return None
+    round_row = (questions.get("rounds") or {}).get(current_round_id) or {}
+    forced = round_row.get("forced_topic")
+    if forced:
+        return forced
+    target = round_row.get("target")
+    if not target:
+        return None
+    return gap_key(target.get("block"), target.get("item_id"))
 
 
 async def _safe_run_batch(
@@ -84,7 +79,25 @@ async def _run_batch(
         return ""
 
     resume = session.get("resume_data", {})
-    result = await run_resume_extraction_chain(resume, input_text)
+    field_completeness = session.get("field_completeness", {})
+    questions = session.get("questions", {})
+
+    already_decided, to_judge = prune_for_judgment(resume, COVERAGE_SCHEMA, field_completeness)
+
+    excluded = set(questions.get("given_up_targets", [])) | set(questions.get("forced_topics_spent", []))
+    current_key = _current_round_key(questions)
+    if current_key:
+        excluded.add(current_key)
+
+    candidates = compute_candidate_queue(
+        resume, ASKABLE_COVERAGE_SCHEMA, field_completeness, excluded_keys=frozenset(excluded),
+    )
+
+    result = await run_combined_chain(
+        resume, COVERAGE_SCHEMA, to_judge, candidates, input_text,
+        last_asked_question=questions.get("last_asked_question"),
+        more_items_checked=questions.get("more_items_checked", []),
+    )
 
     updates = result.get("updates") if result.get("status") in ("update", "extracted") else None
     accepted, rejected = await crud.apply_resume_update(
@@ -96,27 +109,18 @@ async def _run_batch(
         llm_usage=result.get("_llm_usage"),
     )
 
-    # No claim reconciliation here on purpose. The director flushes this queue
-    # and awaits the batch immediately before it selects the next target, then
-    # reconciles there -- so the check happens once, at the point where its
-    # result is actually used, instead of on every batch.
+    merged_completeness = merge_completeness(already_decided, result.get("blocks") or {}, COVERAGE_SCHEMA)
+    await crud.apply_field_completeness(session_id, merged_completeness)
 
-    # Keep field_completeness continuously fresh instead of only on silence:
-    # fire a background grading cycle whenever this batch actually changed
-    # something. Off the critical path (create_task, not awaited) so it never
-    # adds latency to extraction itself. See silence_completeness_worker.py's
-    # run_completeness_grading_cycle -- same grading logic the silence-EOT
-    # worker uses, just triggered here as well, not instead.
-    changed = result.get("status") != "no_update" and (
-        bool(accepted)
-        or bool(result.get("unresolved"))
-        or bool(result.get("resolved_conflicts"))
-        or bool(result.get("resolved_unresolved_ids"))
-    )
-    if changed:
-        task = asyncio.create_task(_safe_run_completeness_grading_cycle(session_id, crud))
-        _grading_tasks[session_id].add(task)
-        task.add_done_callback(lambda t, sid=session_id: _grading_tasks[sid].discard(t))
+    # None (not []) means the combined call failed outright this cycle --
+    # leave the persisted queue untouched rather than reading a transient
+    # provider/schema error as "genuinely nothing left to ask". See
+    # combined_chain._empty_result / _validate_queue.
+    if result.get("queue") is not None:
+        await crud.apply_question_queue(session_id, result["queue"])
+
+    if result.get("more_items_asked"):
+        await crud.mark_more_items_checked(session_id, result["more_items_asked"])
 
     return _cap_carry(result.get("remaining_text") or "")
 
@@ -196,4 +200,3 @@ async def run_resume_analysis_worker(
         pass
     finally:
         pass
-    

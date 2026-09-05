@@ -31,19 +31,18 @@ class Settings(BaseSettings):
 
     resume_room_extraction_trigger_chars: int = 100
     resume_room_extraction_max_carry_multiple: int = 4
-    resume_room_extraction_provider: str = "openrouter"
-    resume_room_extraction_model: str = "openai/gpt-5.6-terra:nitro"
-    resume_room_extraction_max_tokens: int = 1200
+
+    resume_room_combined_provider: str = "openai"
+    resume_room_combined_model: str = "gpt-5.6-terra"
+    resume_room_combined_max_tokens: int = 8000
+    resume_room_combined_reasoning_effort: str = "none"
 
     resume_room_final_pass_provider: str = "openrouter"
     resume_room_final_pass_model: str = "openai/gpt-5.6-terra:nitro"
     resume_room_final_pass_max_tokens: int = 4000
 
-    resume_room_silence_hardbound_seconds: float = 0.1
-    resume_room_completeness_provider: str = "openrouter"
-    resume_room_completeness_model: str = "openai/gpt-5.6-luna:nitro"
-    resume_room_completeness_max_tokens: int = 3000
-    resume_room_answer_silence_seconds: float = 0.1
+    resume_room_silence_hardbound_seconds: float = 0.5
+    resume_room_answer_silence_seconds: float = 0.5
 
     resume_room_question_provider: str = "openai"
     resume_room_question_model: str = "gpt-5.6-terra"

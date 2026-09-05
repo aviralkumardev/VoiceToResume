@@ -81,8 +81,6 @@ async def run_bot(
 
 
     def on_speaking_change(is_speaking: bool):
-        if orchestrator is not None:
-            orchestrator.enqueue_speaking_state(session_id, is_speaking)
         if director is not None:
             director.on_speaking_change(is_speaking)
 
