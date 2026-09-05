@@ -15,15 +15,19 @@ Two independent consumers of the same rubric:
    of `field_completeness` left in the codebase.
 2. **The interview director** (`stt_tts_pipeline/interview_director.py` —
    see [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)) — drives the
-   actual round-based Q&A. It no longer selects a target, grades against a
-   backend-picked path, or writes any verdict itself: one fused LLM call
-   per answer (`question_chain.run_question_chain`, living in
+   actual round-based Q&A. It no longer writes any verdict itself, but it
+   DOES now compute target *selection* deterministically in Python: one
+   fused LLM call per answer (`question_chain.run_question_chain`, living in
    [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)
-   despite the name of this file) grades the just-given answer AND freely
-   drafts both a same-topic probe and a genuinely different next question,
-   reasoning over the whole resume/rubric/conversation itself. The director
-   only reads `field_completeness` in one place — the required-coverage
-   safety net described below — rather than depending on it turn to turn.
+   despite the name of this file) grades the just-given answer AND drafts
+   both a same-topic probe and a next question, but the next question's
+   *subject* must be picked from a Python-computed, exhaustive,
+   priority-ordered candidate list (`next_target.compute_next_targets`) —
+   the model reasons over the whole resume/conversation to decide which
+   candidate is still open and how to word the question, not which block
+   matters most. The director reads `field_completeness` on every single
+   turn now (to build that candidate list), not just once at a safety net —
+   see "The interview loop" below.
 
 This is a substantially simplified replacement for an earlier, much larger
 design (per-target selection, a next-target shortlist, field-group question
@@ -35,7 +39,7 @@ is ever needed — the design docs under `docs/` may still have more color.
 - `.../config_jsons_definitions/coverage_schema.py` — `COVERAGE_SCHEMA`,
   unchanged: per-block/per-field `importance`
   (`required`/`recommended`/`optional`) + a natural-language `complete_when`
-  bar, a per-block `objective_priority` (used by `required_gap.py`'s
+  bar, a per-block `objective_priority` (used by `next_target.py`'s
   ordering — see below), and an optional `not_applicable: true` flag (a
   flagged block/field is placed straight into `already_decided` as
   `NOT_APPLICABLE` by `prune_for_judgment`, never sent to the LLM). `personal`
@@ -66,14 +70,14 @@ is ever needed — the design docs under `docs/` may still have more color.
 - `.../silence_completeness_worker.py` — `run_silence_completeness_worker()`
   / `run_completeness_grading_cycle()`. Unchanged.
 
-The per-answer grading chain (Task B) and the required-coverage safety net
+The per-answer grading chain (Task B) and the deterministic target scanner
 are new modules physically living in `resume_analysis_pipeline/` —
-`question_chain.py`, `question_prompts.py`, `required_gap.py` — even though
+`question_chain.py`, `question_prompts.py`, `next_target.py` — even though
 conceptually they're "completeness" work; see
 [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) for
 their full documentation. The round-based state machine that calls them
 (`_open_round`/`_probe_round`/`_advance_round`/`_pick_forced_topic`/
-`_await_task_a_settle`/`_forced_topics_spent`) is documented in
+`_organic_targets_given_up`/`_forced_topics_spent`) is documented in
 [backend/stt-tts-pipeline.md](stt-tts-pipeline.md).
 
 ## Public surface
@@ -136,35 +140,50 @@ their full documentation. The round-based state machine that calls them
   → one shielded `crud.apply_field_completeness(...)`.
 - `run_completeness_grading_cycle(session_id, crud)` — the grading-only body
   of the above, extracted so it has a second caller: the post-extraction-
-  batch trigger in `analysis_orchestrator.py` (background, unawaited), and
-  the interview director's own required-coverage safety net
-  (`_await_task_a_settle`, bounded with `asyncio.wait_for(...,
-  timeout=resume_room_flush_timeout_seconds)`, the **only** place the
-  director ever awaits this call). Cancellation is the caller's concern —
-  the silence worker's own `_run_one_cycle` still wraps its call in
-  `try/except asyncio.CancelledError: return`.
+  batch trigger in `analysis_orchestrator.py` (background, unawaited). The
+  interview director itself never awaits this call any more — it reads
+  whatever `field_completeness` snapshot is already on the row at the start
+  of `_finish_answer` (possibly a turn or more stale) rather than forcing a
+  catch-up; see "The interview loop" below and
+  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md). Cancellation is the
+  caller's concern — the silence worker's own `_run_one_cycle` still wraps
+  its call in `try/except asyncio.CancelledError: return`.
 
-## The interview loop — now driven by one trusted LLM call, not selection
+## The interview loop — one trusted LLM call, deterministic target selection
 The old design this section used to describe in detail — `select_focus_target`'s
 priority chain (sticky focus, CONFLICT/UNRESOLVED special targets, importance
 tiers, field-group batching), `build_next_target_shortlist`/`open_targets`
 as the LLM's only allowed menu, `answer_evaluation_chain.run_answer_evaluation_chain`'s
 fused grade-plus-shortlist-pick call, and `claim_reconciler`'s async
-pending-BLOCK-claim verification ledger — is gone. Replaced by a much
-smaller design; see [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for
-the full state machine. In outline:
+pending-BLOCK-claim verification ledger — is gone. A live session then
+showed the next iteration of this design (grading + FREE target choice in
+one call, no Python ordering at all) bouncing between blocks
+(`projects` → `experience` → `education` → ...) instead of exhausting one at
+a time, since the model had no enforced priority and wasn't even given the
+round's own current subject. Target *selection* moved back into Python as a
+result — grading and question *wording* remain one fused LLM call, exactly
+as before. See [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for the
+full state machine. In outline:
 
 - **One LLM call per answer** — `question_chain.run_question_chain(resume,
-  coverage, conversation_history, answer_text)` — grades the just-given
-  answer (`answer_grade`: `PARTIAL`/`SUFFICIENT`/`UNABLE_TO_ANSWER`) and
-  drafts BOTH a `probe_question` (used only if the grade stays open and the
-  round isn't capped) and a `next_question` (used only if the grade
-  resolves) in the same response. It receives the **whole** extracted
-  resume, the full `COVERAGE_SCHEMA`, and the entire conversation so far
-  (every round's exchanges, flattened) — no backend-built shortlist, no
-  `also_covered` menu, no target path of any kind. See
-  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) for
-  the chain itself.
+  coverage, conversation_history, answer_text, field_completeness=...,
+  current_target=..., next_target_candidates=...)` — grades the just-given
+  answer (`answer_grade`: `PARTIAL`/`SUFFICIENT`/`UNABLE_TO_ANSWER`), drafts
+  a `probe_question` grounded in `current_target` (the round's own
+  already-known subject) if the grade stays open and the round isn't
+  capped, and drafts a `next_question` for the first entry in
+  `next_target_candidates` not already resolved by the live conversation if
+  the grade resolves. `next_target_candidates` — built by Python's
+  `next_target.compute_next_targets` (`resume_analysis_pipeline/`,
+  touched blocks before untouched, each sorted ascending by
+  `objective_priority`) — is the **complete** remaining list, not a sample:
+  the model may only pick from it, never invent a target outside it, but it
+  still decides which candidate is genuinely still open (using its own
+  freshest context, including the very answer it's grading right now, which
+  `field_completeness` hasn't caught up to yet) and how to word the
+  question. See
+  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md) for the
+  chain itself and `compute_next_targets`'s exact algorithm.
 - **Two small, deterministic Python guardrails sit on top of that trust**,
   both living directly in `InterviewDirector` (not in this module):
   1. **Forced conflict/unresolved priority** — before opening any new round,
@@ -177,27 +196,30 @@ the full state machine. In outline:
      the record itself still happens purely through extraction (Task A) —
      the director never writes anything to resolve a conflict/unresolved
      entry.
-  2. **Required-coverage safety net** — reached only when there's no forced
-     topic and Task B's own `next_question` came back `null`.
-     `required_gap.find_required_gap(field_completeness, COVERAGE_SCHEMA,
-     exclude=...)` (in `resume_analysis_pipeline/`) is checked, after a
-     bounded catch-up (`_await_task_a_settle`: `flush_transcript(wait=True)`
-     then a timeout-bounded `run_completeness_grading_cycle`) — this is the
-     **only** point in the whole interview loop where `field_completeness`
-     is read. It returns the first required-importance block (by
-     `objective_priority`) whose own top-level `completeness_status` isn't
-     terminal and whose `"gap:<block>"` key isn't excluded; `None` once
-     every required block is terminal. A found gap is worded via the same
-     `run_topic_question_chain` and opened as a forced round; `None` means
-     `_complete_interview()` — the only site left that ends the session.
-- **`_forced_topics_spent: Set[str]`** (new, director-only, in-memory) is
-  the anti-infinite-loop mechanism: a forced round's key
-  (`"conflict:<id>"`/`"unresolved:<id>"`/`"gap:<block>"`) is added the
-  moment that round closes — terminal or capped — regardless of whether
-  Task A has actually cleared the underlying record/gap yet. Without this,
-  a just-resolved conflict still sitting in `resume_data["conflicts"]` for
-  one extra turn (extraction hasn't caught up) would force the identical
-  question again immediately.
+  2. **Nothing left → end directly.** Reached only when there's no forced
+     topic and Task B's own `next_question` came back `null`. Because
+     `next_target_candidates` was already the exhaustive remaining list,
+     a null `next_question` legitimately means every askable block is
+     covered — there is no separate required-coverage safety-net call any
+     more (`required_gap.py`/`find_required_gap` deleted, along with the
+     `_await_task_a_settle` catch-up that used to precede it): `_advance_round`
+     goes straight to `_complete_interview()`, the only site left that ends
+     the session.
+- **`_forced_topics_spent: Set[str]`** (director-only, in-memory) is the
+  anti-infinite-loop mechanism for the forced-topic guardrail: a forced
+  round's key (`"conflict:<id>"`/`"unresolved:<id>"`) is added the moment
+  that round closes — terminal or capped — regardless of whether Task A has
+  actually cleared the underlying record yet. Without this, a just-resolved
+  conflict still sitting in `resume_data["conflicts"]` for one extra turn
+  (extraction hasn't caught up) would force the identical question again
+  immediately.
+- **`_organic_targets_given_up: Set[Tuple[str, Optional[str]]]`**
+  (director-only, in-memory) is the equivalent mechanism for the now-
+  deterministic organic path: a `(block, item_id)` a round capped out on
+  while still non-terminal is excluded from every later
+  `compute_next_targets` call for the rest of the session — otherwise that
+  same stuck subject, for which `field_completeness` never gets patched,
+  would deterministically win top priority again next round.
 
 ## Cancellation / commit semantics
 - **Per-answer grading** (`InterviewDirector._finish_answer`) — a
@@ -270,12 +292,15 @@ the full state machine. In outline:
   `build_unable_to_answer_patch` commits an `UNABLE_TO_ANSWER` grade back
   onto the one leaf the closing round's `target` identifies (see above) —
   this is not a return of the old per-answer verdict model (no
-  SUFFICIENT/PARTIAL write, no target-selection), just the one thing the
-  batched grader structurally cannot ever infer on its own. Everything else
-  can still lag further behind the live conversation for stretches of the
-  interview; accepted trade-off, since Task B's own grading input is
-  allowed to be one turn stale and the required-gap safety net explicitly
-  forces a catch-up before it's ever actually relied on to end the session.
+  SUFFICIENT/PARTIAL write), just the one thing the batched grader
+  structurally cannot ever infer on its own. Everything else can still lag
+  further behind the live conversation for stretches of the interview;
+  accepted trade-off, since `compute_next_targets` reads whatever snapshot
+  is already on the row (no forced catch-up any more — there's no
+  safety-net tier left to force one ahead of) and the fused call is
+  designed to tolerate that staleness by using its own freshest context (the
+  answer it's grading right now) to skip a candidate `field_completeness`
+  hasn't caught up to yet.
 - The two silence windows still mean different things even though both
   currently sit at 2.0s: `resume_room_silence_hardbound_seconds` gates the
   batched worker's own debounce; `resume_room_answer_silence_seconds` gates
@@ -285,6 +310,18 @@ the full state machine. In outline:
   arm only on a stop-speaking event.
 
 ## Last synced
+2026-09-05 (yet later still — deterministic block-priority target selection:
+a live session showed the fully-free-choice fused call bouncing between
+blocks instead of exhausting one at a time. Target *selection* moved to a
+new Python scanner, `next_target.compute_next_targets` — grading and
+question *wording* remain exactly one fused LLM call, same as before this
+change, just no longer trusted to pick which block matters most on its own.
+The old required-coverage safety net (`required_gap.py`/`find_required_gap`,
+`InterviewDirector._await_task_a_settle`) is gone entirely, superseded by
+`compute_next_targets` being exhaustive by construction — see "The
+interview loop" above and
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)/[backend/stt-tts-pipeline.md](stt-tts-pipeline.md)
+for the full change.)
 2026-09-05 (later still — `question_chain.py`'s `run_question_chain`/
 `run_topic_question_chain` moved off `resume_room_completeness_*` onto their
 own `resume_room_question_*` settings, and onto a new `OpenAIProvider`

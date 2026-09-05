@@ -126,28 +126,48 @@ four methods that manage it (`start_round`/`append_round_question`/
   the idle/recovery path.
 
 **`_finish_answer()`** — once the answer-silence window elapses:
-1. Builds `resume`/`history` from a fresh `get_session` read
-   (`_build_conversation_history` flattens every round's exchanges, in
+1. Builds `resume`/`field_completeness`/`history` from a fresh `get_session`
+   read (`_build_conversation_history` flattens every round's exchanges, in
    `round_order` order, into `[{"question", "answer"}, ...]` — the *whole*
-   session, no windowing/truncation).
+   session, no windowing/truncation). Also reads `round_row =
+   questions.rounds[round_id]` from this same row (safe this early —
+   `record_round_answer` only ever fills an existing exchange's `answer`
+   field, it never changes `questions.rounds`' shape) to get
+   `current_target = round_row.get("target")` — this round's own
+   already-known subject — and computes `next_target_candidates =
+   next_target.compute_next_targets(resume, ASKABLE_COVERAGE_SCHEMA,
+   field_completeness, exclude_targets=...)`, excluding `current_target`'s own
+   `(block, item_id)` plus every pair in `self._organic_targets_given_up`
+   (see below). Both are threaded into the fused call in step 3 below — see
+   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)'s
+   `next_target.compute_next_targets` for exactly how that list is built and
+   ordered.
 2. Fires `orchestrator.flush_transcript(session_id, wait=False)` —
    fire-and-forget, never awaited here. This is Task A: the unchanged
    extraction+coverage pipeline, running purely in the background. Task B
    below is the turn's only critical-path work.
 3. Awaits `question_chain.run_question_chain(resume, ASKABLE_COVERAGE_SCHEMA,
-   history, answer_text, field_completeness=row.get("field_completeness") or
-   {})` — the ONE LLM call for the whole turn. `ASKABLE_COVERAGE_SCHEMA`
-   (`coverage_schema.py`'s `COVERAGE_SCHEMA` with every `not_applicable`
-   block removed) is used here instead of the raw schema so the fused call
-   can never draft a question about `personal`/`summary` — that information
-   is captured elsewhere in the product, never through this interview.
-   `field_completeness` (the batched worker's last per-field/per-item
-   verdicts, possibly a turn or more stale) grounds `probe_question`/
-   `next_question` in exactly which fields are still open, so a probe
-   targets precisely what's missing on the current item instead of padding
-   in a generic re-ask for something already given. Whenever `next_question`
-   is non-null, the same response self-reports `next_question_target`
-   (block/item/field metadata about that question — see
+   history, answer_text, field_completeness=field_completeness,
+   current_target=current_target,
+   next_target_candidates=next_target_candidates)` — the ONE LLM call for
+   the whole turn. `ASKABLE_COVERAGE_SCHEMA` (`coverage_schema.py`'s
+   `COVERAGE_SCHEMA` with every `not_applicable` block removed) is used here
+   instead of the raw schema so the fused call can never draft a question
+   about `personal`/`summary` — that information is captured elsewhere in the
+   product, never through this interview. `field_completeness` (the batched
+   worker's last per-field/per-item verdicts, possibly a turn or more stale)
+   grounds `probe_question` in exactly which of `current_target`'s fields are
+   still open, so a probe targets precisely what's missing on the current
+   item instead of padding in a generic re-ask for something already given.
+   Target *selection* for `next_question` is no longer the model's own
+   choice: it must pick the first entry in `next_target_candidates` not
+   already resolved by the live conversation (including this very answer,
+   which `field_completeness` hasn't caught up to yet) — the list is
+   exhaustive by construction, so "every candidate already resolved"
+   legitimately means nothing is left. Whenever `next_question` is non-null,
+   the same response self-reports `next_question_target` (validated against
+   `next_target_candidates` by `question_chain._validate_next_target` before
+   being trusted — see
    [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)),
    carried forward to step 4's `_advance_round` call below. If
    `is_meta_question` and `meta_response`: records the aside under
@@ -160,11 +180,15 @@ four methods that manage it (`start_round`/`append_round_question`/
    for the real answer that follows once the pending question is re-spoken.
 4. Otherwise starts `crud.record_round_answer` as a shielded task (created,
    not yet awaited — see "Bookkeeping writes deferred past the TTS queue"
-   below), computes `capped` from the round's exchange count vs. its stamped
-   `max_questions` (read from the row already fetched in step 1, not a fresh
-   `get_session` — `record_round_answer` only fills in an existing
-   exchange's `answer` field, never changes the count), and branches on
-   `answer_grade`:
+   below), computes `capped` from `round_row` (the same one read in step 1,
+   not a fresh `get_session`)'s exchange count vs. its stamped
+   `max_questions`. If `capped and not terminal`, also adds
+   `(current_target["block"], current_target.get("item_id"))` to
+   `self._organic_targets_given_up` (when `current_target` is set) — this
+   round is giving up on a subject `field_completeness` will never be
+   patched for, so without this it would otherwise be handed straight back
+   as the top-priority `next_target_candidates` entry next round. Then
+   branches on `answer_grade`:
    - **non-terminal (`PARTIAL`), under cap, `probe_question` present** →
      `_probe_round(probe_question)` (queues the probe's `TTSSpeakFrame`
      first), *then* awaits the `record_round_answer` task.
@@ -240,35 +264,26 @@ path (with Task B's own `next_question`/`next_question_target`) and from
    Whatever `next_question`/`next_question_target` Task B organically
    drafted this turn is discarded outright — a conflict or unresolved fact
    outranks anything the LLM proposed on its own.
-2. **Else, if `next_question` is truthy**, sanitizes Task B's own
-   `next_question_target` via `_sanitize_target(next_question_target,
-   ASKABLE_COVERAGE_SCHEMA)` — `block` must be a string actually present in
-   `ASKABLE_COVERAGE_SCHEMA`, else the whole target is dropped to `None`;
-   `item_id` is coerced to `None` unless already a string; `fields` is
-   filtered down to only the entries that are real field keys of that block
-   (per `coverage[block]["fields"]`), collapsing to `None` if nothing valid
-   survives — then opens it directly (`_open_round(next_question,
-   forced=None, target=target)`). This is the common case: Task B's own
-   free choice of what to ask next, trusted as-is (only the *target
-   metadata* is validated, never the question text itself or whether it
-   should be asked).
-3. **Else, the required-coverage safety net.** `_await_task_a_settle()`
-   awaits `orchestrator.flush_transcript(wait=True)` then a
-   timeout-bounded `run_completeness_grading_cycle` (swallowing
-   `asyncio.TimeoutError`) — the *only* place Task A is ever awaited, and
-   the only place the director ever reads `field_completeness`. Re-fetches
-   the row and calls `required_gap.find_required_gap(field_completeness,
-   COVERAGE_SCHEMA, exclude=frozenset(self._forced_topics_spent))` (which
-   internally filters `COVERAGE_SCHEMA` through `askable_coverage_schema`
-   before applying the `required`-importance check — see
-   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)). If a
-   gap comes back: builds `topic_description = f"the '{block}' section --
-   {complete_when}"`, words it via the same `run_topic_question_chain`
-   (again passing `field_completeness=row.get("field_completeness") or
-   {}`), builds `target = {"block": gap["block"], "item_id": None,
-   "fields": None}`, and opens a forced round (`forced=gap["forced_topic"]`, i.e.
-   `"gap:<block>"`, `target=target`). If `None`: `_complete_interview()` —
-   the only site that ends the session.
+2. **Else, if `next_question` is truthy**, opens it directly
+   (`_open_round(next_question, forced=None, target=next_question_target)`)
+   — no sanitization needed here any more: `next_question_target` already
+   came back from `question_chain.run_question_chain` validated against the
+   exhaustive `next_target_candidates` list `_finish_answer` computed and
+   handed it (see above), so it's guaranteed to name one of those candidates
+   (or the fallback candidate #1, on any mismatch/hallucination) rather than
+   an arbitrary block/field pair.
+3. **Else (`next_question` falsy) → `_complete_interview()` directly.**
+   No intermediate safety-net call of any kind: since
+   `next_target_candidates` was already the complete remaining
+   priority-ordered list of everything askable, a null `next_question`
+   means the fused call determined every one of those candidates was
+   already resolved — which, because the list was exhaustive, is the same
+   thing as "genuinely nothing left to ask." There is no
+   `find_required_gap`/`required_gap.py` any more (deleted — see
+   [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) and
+   no `_await_task_a_settle` (deleted too, since its only caller was this
+   now-removed branch) — this tier never awaits Task A or re-reads
+   `field_completeness` at all.
 
 **Doubt/meta-question handling** — the candidate can go off-script mid-
 answer to ask about the process itself ("how long is this?") instead of
@@ -351,16 +366,22 @@ Three things the director owns beyond the round machinery above:
   than leaving it ambiguous which of several entries is meant — the same
   problem `next_question_target`'s `item_id` solves for organic questions,
   solved here on the deterministic forced-topic path.
-- **`_sanitize_target(target, coverage) -> Optional[dict]`** (staticmethod)
-  — the trust boundary for Task B's self-reported `next_question_target`:
-  drops the whole target to `None` unless `block` is a string present in
-  `coverage`; coerces `item_id` to `None` unless already a string; filters
-  `fields` down to only the entries that are real field keys of that block
-  (`coverage[block]["fields"]`'s own keys), dropping any hallucinated name,
-  and collapses to `None` if nothing valid survives. Never validates the
-  *question text* itself or whether it should be asked — Task B is still
-  trusted fully on that; this only protects `field_completeness` from ever
-  being patched under a bogus/hallucinated block or field key.
+- **`_organic_targets_given_up: Set[Tuple[str, Optional[str]]]`** — every
+  `(block, item_id)` a round gave up on (capped while still non-terminal),
+  permanent for the session. Passed as part of `exclude_targets` to every
+  later `next_target.compute_next_targets` call so a stuck subject — one
+  `field_completeness` will never mark terminal on its own, since the
+  candidate never actually resolved it — can't deterministically win top
+  priority forever now that selection is no longer up to the LLM's own
+  judgment. A block that genuinely turns terminal later still drops out on
+  its own via `compute_next_targets`'s terminal-status filter, independent
+  of this set. The trust boundary for `next_question_target` itself moved
+  into `question_chain._validate_next_target` (see
+  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)) —
+  there's no longer a director-side `_sanitize_target` (deleted): it's
+  cheaper to validate containment in the small Python-built candidate list
+  than the whole coverage schema, and that check now lives next to the call
+  that produces the value being checked.
 - **`_forced_topics_spent: Set[str]`** — see
   [backend/completeness-pipeline.md](completeness-pipeline.md)'s "The
   interview loop". New, director-only, in-memory anti-infinite-loop state;
@@ -438,6 +459,32 @@ Three things the director owns beyond the round machinery above:
   rejoins in that window.
 
 ## Last synced
+2026-09-05 (yet later still — deterministic block-priority target selection:
+a live session showed the fused call bouncing between blocks
+(`projects` → `experience` → `education` → ...) instead of exhausting one at
+a time, because it was never given the round's own `current_target` and had
+no enforced ordering for `next_question_target`. `_finish_answer` now reads
+`current_target` from the round's own stored `target` and computes
+`next_target_candidates` via the new
+`next_target.compute_next_targets(resume, ASKABLE_COVERAGE_SCHEMA,
+field_completeness, exclude_targets=...)` (touched blocks before untouched,
+each in `objective_priority` order — see
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)), both
+threaded into the same fused `run_question_chain` call — grading + question
+wording is still exactly ONE LLM call, only target *selection* moved to
+Python. `next_question_target` is now validated against that candidate list
+by `question_chain._validate_next_target` before being trusted, so
+`_advance_round` opens it directly with no sanitization step of its own.
+Deleted as a result (fully superseded, no remaining callers): `required_gap.py`/
+`find_required_gap` (the exhaustive candidate list makes its narrower
+required-tier-only safety net redundant — there is no more fallback tier at
+all, a null `next_question` now goes straight to `_complete_interview()`),
+`_sanitize_target` (validation moved to `question_chain._validate_next_target`,
+next to where the value is produced), and `_await_task_a_settle` (its only
+caller was the now-removed required-gap branch). Added
+`_organic_targets_given_up` (mirrors `_forced_topics_spent`) so a block/item
+that caps out while still non-terminal doesn't deterministically win top
+priority forever now that selection is fully deterministic.)
 2026-09-05 (yet later still — latency fix: `_finish_answer` now starts
 `record_round_answer`/`close_round`/`apply_field_completeness` as shielded
 tasks but defers awaiting them until after the next question/probe's

@@ -106,10 +106,11 @@ as a typed setting read from `.env`.
   `resume_room_flush_timeout_seconds` (default `8.0`) bounds how long
   `ResumeRoomOrchestrator.flush_transcript` will wait for a forced,
   out-of-turn extraction batch — used by `room_orchestrator.flush_transcript`
-  itself and now also by the interview director's required-coverage safety
-  net (`_await_task_a_settle`, which bounds both the flush wait and the
-  follow-up `run_completeness_grading_cycle` call with this same timeout) —
-  see [backend/room-orchestration.md](room-orchestration.md) and
+  itself. No longer used by the interview director: its former
+  required-coverage safety net (`_await_task_a_settle`, which used to bound
+  both the flush wait and a follow-up `run_completeness_grading_cycle` call
+  with this same timeout) was deleted along with `required_gap.py` — see
+  [backend/room-orchestration.md](room-orchestration.md) and
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md).
   `question_chain.py`'s two chains (`run_question_chain`,
   `run_topic_question_chain`) now have their **own** settings —
@@ -130,6 +131,12 @@ as a typed setting read from `.env`.
   this ever needs a second allowed origin.
 
 ## Last synced
+2026-09-05 (yet later still — noted `resume_room_flush_timeout_seconds` is no
+longer used by the interview director: its required-coverage safety net
+(`_await_task_a_settle`) was deleted along with `required_gap.py` as part of
+deterministic block-priority target selection — see
+[backend/stt-tts-pipeline.md](stt-tts-pipeline.md) and
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md).)
 2026-09-05 (yet later still — corrected `resume_room_question_reasoning_effort`'s
 default here to `"none"` (matching `config.py`'s actual current value, not
 the `"low"` this doc previously claimed) and noted `question_prompts.py`'s

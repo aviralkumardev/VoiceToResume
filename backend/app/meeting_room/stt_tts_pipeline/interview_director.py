@@ -13,15 +13,12 @@ from app.meeting_room.resume_analysis_pipeline.config_jsons_definitions.coverage
 from app.meeting_room.resume_analysis_pipeline.completeness_status import (
     build_unable_to_answer_patch,
 )
+from app.meeting_room.resume_analysis_pipeline.next_target import compute_next_targets
 from app.meeting_room.resume_analysis_pipeline.question_chain import (
     ANSWER_GRADE_UNABLE_TO_ANSWER,
     TERMINAL_GRADES,
     run_question_chain,
     run_topic_question_chain,
-)
-from app.meeting_room.resume_analysis_pipeline.required_gap import find_required_gap
-from app.meeting_room.resume_analysis_pipeline.silence_completeness_worker import (
-    run_completeness_grading_cycle,
 )
 
 CLOSING_MESSAGE = (
@@ -44,9 +41,14 @@ class InterviewDirector:
         answer: it gets graded by the ONE fused LLM call in
         `question_chain.run_question_chain`, which grades the answer AND
         drafts both a probe (for if it stays open) and a next question (for
-        if it resolves) in the same response. There is no backend target
-        selection, shortlist, or menu the LLM must pick from -- it reasons
-        freely over the whole resume and coverage rubric.
+        if it resolves) in the same response. Target *selection* is NOT the
+        LLM's decision any more: `_finish_answer` hands it `current_target`
+        (this round's own already-known subject) and `next_target_candidates`
+        (the complete, Python-computed, priority-ordered list of everything
+        else left to ask about, from `next_target.compute_next_targets`) --
+        the model only picks the first candidate not already resolved by the
+        live conversation and words a question for it; it can't invent a
+        target outside that list.
 
     Every question lives inside a ROUND (`data/crud.py`'s
     `questions.rounds`): one round per subject, holding one or more
@@ -55,27 +57,30 @@ class InterviewDirector:
     once the fused call's `answer_grade` is terminal (SUFFICIENT /
     UNABLE_TO_ANSWER) or the budget runs out.
 
-    Two narrow, deterministic Python guardrails sit on top of the LLM's own
-    judgment, checked only at round-open decisions (`_advance_round`), never
+    Two narrow, deterministic Python guardrails sit on top of everything
+    else, checked only at round-open decisions (`_advance_round`), never
     mid-round:
       1. `_pick_forced_topic` -- an outstanding conflict/unresolved record in
-         the resume jumps the queue ahead of whatever the LLM would have
-         asked next. Settlement still happens purely through extraction
+         the resume jumps the queue ahead of whatever the fused call would
+         have asked next. Settlement still happens purely through extraction
          (Task A); the director never writes anything to settle one itself.
-      2. `find_required_gap` -- before ending the interview because the LLM
-         said there's nothing left to ask, a required coverage block that's
-         still genuinely open forces one more question instead.
-      `_forced_topics_spent` bounds both to at most one forced round each,
-      so a candidate who keeps dodging (or extraction that hasn't caught up
-      yet) can't loop the interview forever.
+      2. `_organic_targets_given_up` -- a block/item a round gave up on
+         (hit the per-round question budget while still non-terminal) is
+         excluded from every later `compute_next_targets` call for the rest
+         of the session, so a stuck subject can't deterministically win top
+         priority forever once selection is no longer up to the LLM.
+      `_forced_topics_spent` bounds the forced-topic guardrail to at most one
+      forced round each, so a candidate who keeps dodging (or extraction
+      that hasn't caught up yet) can't loop the interview forever.
 
     Extraction (Task A) is triggered out-of-turn every answer
-    (`orchestrator.flush_transcript(..., wait=False)`, fire-and-forget) but
-    is otherwise off the critical path entirely -- the turn's only
-    critical-path work is the fused grading call. Task A is only ever
-    AWAITED once, in `_await_task_a_settle`, immediately before the
-    required-gap safety net reads `field_completeness` to decide whether the
-    interview can end.
+    (`orchestrator.flush_transcript(..., wait=False)`, fire-and-forget) and
+    is entirely off the critical path -- the turn's only critical-path work
+    is the fused grading call. `field_completeness` (read for
+    `compute_next_targets`) can therefore lag the live conversation by a
+    turn or more; that staleness is exactly what `next_target_candidates`
+    being handed to a model with the freshest possible context (the very
+    answer it's grading right now) is designed to tolerate.
 
     Questions are spoken straight through TTS (TTSSpeakFrame,
     append_to_context=False). `pipeline.py` additionally suppresses
@@ -135,6 +140,15 @@ class InterviewDirector:
         # turn, or a required block the candidate keeps dodging, would force
         # the identical question again next round-open.
         self._forced_topics_spent: Set[str] = set()
+        # Every (block, item_id) a round gave up on -- hit
+        # max_questions_per_round while still non-terminal, so
+        # field_completeness was never patched for it. Permanent for the
+        # session, same lifetime as _forced_topics_spent: without this, a
+        # stuck block would be handed back at top priority by
+        # compute_next_targets forever. A block that genuinely turns
+        # terminal later still drops out on its own via the terminal-status
+        # filter, regardless of this set.
+        self._organic_targets_given_up: Set[Tuple[str, Optional[str]]] = set()
 
 
     async def ask_opening_question(self, question: str) -> None:
@@ -346,38 +360,6 @@ class InterviewDirector:
         return None
 
 
-    @staticmethod
-    def _sanitize_target(
-        target: Optional[Dict[str, Any]], coverage: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Validates the fused call's self-reported `next_question_target`
-        before trusting it: `block` must be a real askable coverage block,
-        else the whole target is dropped to None rather than stored
-        half-trustworthy. `item_id` is kept only when it's actually a
-        string; `fields` is kept only as the subset of its entries that are
-        actually real field keys of that block (per `coverage`), dropping
-        any hallucinated name -- an empty/invalid list collapses to None,
-        same as "whole-block/first-mention question"."""
-        if not isinstance(target, dict):
-            return None
-        block = target.get("block")
-        if not isinstance(block, str) or block not in coverage:
-            return None
-        item_id = target.get("item_id")
-        valid_fields = set((coverage[block].get("fields") or {}).keys())
-        raw_fields = target.get("fields")
-        fields = (
-            [f for f in raw_fields if isinstance(f, str) and f in valid_fields]
-            if isinstance(raw_fields, list)
-            else None
-        )
-        return {
-            "block": block,
-            "item_id": item_id if isinstance(item_id, str) else None,
-            "fields": fields or None,
-        }
-
-
     @classmethod
     def _forced_topic_description(
         cls, key: str, record: Dict[str, Any], resume: Dict[str, Any]
@@ -428,23 +410,6 @@ class InterviewDirector:
         return history
 
 
-    async def _await_task_a_settle(self) -> None:
-        """Bounded catch-up for extraction+grading, called ONLY from the
-        required-gap safety net -- never on every turn. Task A is otherwise
-        entirely fire-and-forget from this director's point of view; this is
-        the one place `field_completeness` freshness actually matters,
-        because it's the one place a decision (end the interview, or not)
-        depends on it."""
-        await self._orchestrator.flush_transcript(self._session_id, wait=True)
-        try:
-            await asyncio.wait_for(
-                run_completeness_grading_cycle(self._session_id, self._crud),
-                timeout=settings.resume_room_flush_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            pass
-
-
     async def _advance_round(
         self,
         next_question: Optional[str] = None,
@@ -452,15 +417,18 @@ class InterviewDirector:
     ) -> None:
         """Decides what to open next, in priority order: a forced conflict/
         unresolved topic, else the fused call's own already-drafted
-        `next_question` (no further checks -- it had everything it should
-        have needed to check), else the required-gap safety net, else the
+        `next_question` (already validated against the candidate list
+        `_finish_answer` gave it -- no further checks needed here), else the
         interview is genuinely done.
 
         `next_question` is None both for the idle/cold-start caller
         (`_run_after_silence`, which has no fused response to draw from) and
         whenever `_finish_answer` closed a round with nothing usable to
-        carry forward. `next_question_target` is the fused call's own
-        (unsanitized) `next_question_target` for that same `next_question`.
+        carry forward, or the fused call determined every given candidate
+        was already resolved. `next_target_candidates` handed to that call
+        is exhaustive by construction (`compute_next_targets`), so a null
+        `next_question` here legitimately means nothing is left to ask --
+        there is no fallback/safety-net tier after this one.
         """
         row = await self._crud.get_session(self._session_id)
         if row is None:
@@ -489,35 +457,10 @@ class InterviewDirector:
             return
 
         if next_question:
-            target = self._sanitize_target(next_question_target, ASKABLE_COVERAGE_SCHEMA)
-            await self._open_round(next_question, forced=None, target=target)
+            await self._open_round(next_question, forced=None, target=next_question_target)
             return
 
-        await self._await_task_a_settle()
-        row = await self._crud.get_session(self._session_id)
-        if row is None:
-            return
-
-        gap = find_required_gap(
-            row.get("field_completeness") or {},
-            COVERAGE_SCHEMA,
-            exclude=frozenset(self._forced_topics_spent),
-        )
-        if gap is None:
-            await self._complete_interview()
-            return
-
-        topic_description = f"the '{gap['block']}' section -- {gap['complete_when']}"
-        history = self._build_conversation_history(row)
-        worded = await run_topic_question_chain(
-            row.get("resume_data") or {},
-            COVERAGE_SCHEMA,
-            history,
-            topic_description,
-            field_completeness=row.get("field_completeness") or {},
-        )
-        target = {"block": gap["block"], "item_id": None, "fields": None}
-        await self._open_round(worded["question"], forced=gap["forced_topic"], target=target)
+        await self._complete_interview()
 
 
     async def _finish_answer(self) -> None:
@@ -538,15 +481,33 @@ class InterviewDirector:
 
         row = await self._crud.get_session(self._session_id)
         resume = (row or {}).get("resume_data") or {}
+        field_completeness = (row or {}).get("field_completeness") or {}
         history = self._build_conversation_history(row or {})
+
+        # Hoisted here (rather than after the call, as before) so
+        # current_target/next_target_candidates can be computed before
+        # run_question_chain -- safe to read from `row` fetched just above
+        # since record_round_answer only fills an existing exchange's
+        # `answer` field, it never changes questions.rounds' shape.
+        round_row = (
+            ((row or {}).get("questions") or {}).get("rounds", {}).get(round_id)
+        ) or {}
+        current_target = round_row.get("target")
+        exclude_targets = set(self._organic_targets_given_up)
+        if current_target:
+            exclude_targets.add((current_target.get("block"), current_target.get("item_id")))
+        next_target_candidates = compute_next_targets(
+            resume,
+            ASKABLE_COVERAGE_SCHEMA,
+            field_completeness,
+            exclude_targets=frozenset(exclude_targets),
+        )
 
         # Fire-and-forget: every line of this answer already reached the
         # extraction queue live as it was transcribed (see pipeline.py's
         # persist()), so there's nothing to lose by forcing that batch out
         # now instead of waiting for the char-count trigger. Never awaited
-        # -- Task A is off this turn's critical path entirely; the only
-        # place it's ever awaited is _await_task_a_settle, on the required-
-        # gap safety net path.
+        # -- Task A is entirely off this turn's critical path.
         await self._orchestrator.flush_transcript(self._session_id, wait=False)
 
         try:
@@ -554,15 +515,19 @@ class InterviewDirector:
             # drafts both possible follow-ups (a probe for if it stays open,
             # a next_question for if it resolves) in the same response.
             # ASKABLE_COVERAGE_SCHEMA (not_applicable blocks removed) so it
-            # can never draft a question about personal/summary; field_completeness
-            # grounds the probe/next_question in exactly which fields are
-            # still open instead of a generic re-ask.
+            # can never draft a question about personal/summary;
+            # current_target grounds the probe in this round's own known
+            # subject; next_target_candidates is the exhaustive, Python-
+            # ordered list of what to ask next if this answer resolves --
+            # the model may only pick from it, never invent a target.
             result = await run_question_chain(
                 resume,
                 ASKABLE_COVERAGE_SCHEMA,
                 history,
                 answer_text,
-                field_completeness=(row or {}).get("field_completeness") or {},
+                field_completeness=field_completeness,
+                current_target=current_target,
+                next_target_candidates=next_target_candidates,
             )
 
             # Past this line the turn is ours to commit -- everything below
@@ -605,15 +570,11 @@ class InterviewDirector:
             probe_question = result.get("probe_question")
             terminal = grade in TERMINAL_GRADES
 
-            # round_row/budget/spent come from `row` (fetched above, before
-            # this turn's answer was recorded) rather than a fresh
-            # get_session -- record_round_answer only fills in an existing
-            # exchange's `answer` field (crud.py), it never changes the
-            # exchange count, and nothing else touches questions.rounds
-            # concurrently, so this is already accurate.
-            round_row = (
-                ((row or {}).get("questions") or {}).get("rounds", {}).get(round_id)
-            ) or {}
+            # round_row (computed above, before this turn's answer was
+            # recorded) is still accurate here -- record_round_answer only
+            # fills in an existing exchange's `answer` field (crud.py), it
+            # never changes the exchange count, and nothing else touches
+            # questions.rounds concurrently.
             budget = int(
                 round_row.get("max_questions") or settings.resume_room_max_questions_per_round
             )
@@ -624,6 +585,10 @@ class InterviewDirector:
                     "interview director giving up on round {} after {} of {} questions",
                     round_id, spent, budget,
                 )
+                if current_target:
+                    self._organic_targets_given_up.add(
+                        (current_target.get("block"), current_target.get("item_id"))
+                    )
 
             if not terminal and not capped and probe_question:
                 await self._probe_round(probe_question)

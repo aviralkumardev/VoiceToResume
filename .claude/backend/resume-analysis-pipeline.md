@@ -30,9 +30,11 @@ session ends to clean up anything left ambiguous.
   surface" below and
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)/[backend/completeness-pipeline.md](completeness-pipeline.md)
   for how the director calls them.
-- `backend/app/meeting_room/resume_analysis_pipeline/required_gap.py` — the
-  required-coverage-block safety net consulted before the interview is
-  allowed to end. See "Public surface" below.
+- `backend/app/meeting_room/resume_analysis_pipeline/next_target.py` — the
+  deterministic, priority-ordered target scanner (`compute_next_targets`)
+  the interview director hands to the fused call as the exhaustive
+  candidate list `next_question_target` must be picked from. Replaces the
+  deleted `required_gap.py`. See "Public surface" below.
 
 ## Public surface
 - `run_resume_analysis_worker(session_id, queue, crud)` (async, run as an
@@ -85,7 +87,7 @@ session ends to clean up anything left ambiguous.
   (which reads `field_completeness` once per gap check — see
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)), and for external/debug
   readers. See [backend/completeness-pipeline.md](completeness-pipeline.md).
-- **`run_question_chain(resume, coverage, conversation_history, answer_text, field_completeness=None) -> dict`**
+- **`run_question_chain(resume, coverage, conversation_history, answer_text, field_completeness=None, *, current_target=None, next_target_candidates=None) -> dict`**
   (`question_chain.py`) — the single LLM call the interview director makes
   per answer turn. Given the whole extracted `resume`, the *askable*
   coverage rubric (see `ASKABLE_COVERAGE_SCHEMA` below — this chain applies
@@ -101,65 +103,85 @@ session ends to clean up anything left ambiguous.
   `TERMINAL_GRADES` constants in `question_chain.py` — a distinct, narrower
   concept than `completeness_status.TERMINAL_STATUSES`, since
   `NOT_APPLICABLE` has no meaning for a single graded answer); and always
-  drafts BOTH a `probe_question` (narrows the current subject, grounded in
-  `field_completeness` to target exactly the fields still MISSING/PARTIAL
-  on the item/subject just discussed rather than a generic catch-all ask)
-  and a `next_question` (freely scans the whole resume/rubric for the
-  single most valuable gap — required tier before recommended before
-  optional, prefers continuing an already-started block/item using the same
-  `field_completeness`-grounded precision, `null` only when genuinely
-  nothing meaningful remains) in the same response, regardless of grade.
-  There is no backend-built shortlist and no target path of any kind — the
-  LLM reasons over the full context directly. `field_completeness` is
-  explicitly flagged in the prompt as possibly one-or-more-turns stale
-  (written by a separate batched worker) — `resume`/`conversation_history`
-  win on any disagreement. Fail-soft: `_empty_result()` on an empty
-  `answer_text` or a provider/schema error defaults to `answer_grade=PARTIAL`,
-  everything else `None`/`False` — "nothing usable" always means "still
-  open," never "done." Uses its own settings, separate from
-  `completeness_chain.py` —
+  drafts BOTH a `probe_question` and a `next_question` in the same response,
+  regardless of grade.
+
+  **Target *selection* is Python's job, not this chain's.** `current_target`
+  (`{"block", "item_id", "fields"}|None`) is the calling round's own
+  already-known subject — `probe_question` is grounded in it directly
+  instead of being re-inferred from raw conversation text.
+  `next_target_candidates` is the COMPLETE, priority-ordered list of
+  everything else left to ask about (built by
+  `next_target.compute_next_targets`, below — touched blocks before
+  untouched, each in `objective_priority` order): the model may only word
+  `next_question` for the first candidate not already resolved by the live
+  conversation (including the very answer it's grading right now, which
+  `field_completeness` can't have caught up to yet), narrowing that
+  candidate's own `fields` down to whichever are genuinely still open. It
+  can never invent a target outside this list. Because the list is
+  exhaustive by construction, "every given candidate is already resolved"
+  and "nothing is left to ask" are the same condition — `next_question`/
+  `next_question_target` are `null` only when `next_target_candidates` is
+  empty or every entry in it is resolved; otherwise both are required. This
+  is a two-tier design with **no fallback/safety-net tier of any kind** — if
+  the model determines the whole list is resolved, the interview really is
+  done (see `InterviewDirector._advance_round`,
+  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)).
+
+  `field_completeness` is explicitly flagged in the prompt as possibly
+  one-or-more-turns stale (written by a separate batched worker) —
+  `resume`/`conversation_history` win on any disagreement. Fail-soft:
+  `_empty_result()` on an empty `answer_text` or a provider/schema error
+  defaults to `answer_grade=PARTIAL`, everything else `None`/`False` —
+  "nothing usable" always means "still open," never "done." Uses its own
+  settings, separate from `completeness_chain.py` —
   `resume_room_question_provider` (default `"openai"`),
   `resume_room_question_model`, `resume_room_question_max_tokens`,
   `resume_room_question_reasoning_effort` — routed through `OpenAIProvider`
   by default, not `OpenRouterProvider`; see
   [backend/llm-providers.md](llm-providers.md).
+
   Whenever `next_question` is non-null, the response also self-reports
   `next_question_target: {"block", "item_id", "fields"}` (`item_id`
-  nullable, `fields` an optional *list* of field names) describing what
-  that freshly-drafted question is about — not a menu Python hands it,
-  metadata about its own already-made choice; `null` only when the question
-  genuinely isn't about one specific coverage gap (e.g. asking whether
-  there are other items in a repeatable block beyond what's captured).
-  `fields` is plural (not a single field) precisely so one question can
-  name every currently-open field of the targeted item/block at once.
-  Three prompt rules force this to be precise rather than blended: (1) the
-  **block/field collision rule** — `experience`'s own `projects`/
-  `achievements`/`awards` fields (scoped to one specific job) are a
-  different concept from the top-level `projects`/`achievements`/`awards`
-  blocks (the candidate's own standalone entries); a question about a
-  specific job's projects/achievements/awards reports `"block":
-  "experience"` with the matching entries in `fields`, never the standalone
-  block name; (2) the **name-the-specific-item rule** — for a repeatable
-  block (`experience`/`education`/`projects`/`certifications`/`courses`)
-  with more than one item, a question about one specific existing item must
-  name that item's own identifying detail (role/company, degree/college, or
-  the item's name) rather than a bare generic reference; (3) the
-  **consolidate, don't drip-feed rule** (added after a live run produced
-  four separate rounds for one experience item's four remaining open
-  fields, asked one at a time) — before narrowing to a specific item/block,
-  check `field_completeness`'s per-item field breakdown; if more than one
-  field is still MISSING/PARTIAL for it, the single question MUST cover all
-  of them together (e.g. "where was your internship at AI Solve based, and
-  did you work on any specific projects, achieve any notable results, or
-  receive any awards during that role?"), listing every field it addresses
-  in `fields` — never split them across separate rounds, even non-
-  consecutive ones. `InterviewDirector` sanitizes `next_question_target`
-  before trusting it (`_sanitize_target` — `block` must be a real askable
-  coverage block else the whole target is dropped; each entry in `fields`
-  must be a real field key of that block per `coverage`, else it's dropped
-  from the list) and stores it on the round it opens; a later
-  `UNABLE_TO_ANSWER` grade on that round commits every field in `fields`
-  back into `field_completeness` in one patch via
+  nullable, `fields` an optional *list* of field names) naming exactly
+  which given candidate it used. `fields` is plural (not a single field)
+  precisely so one question can name every currently-open field of the
+  targeted item/block at once. Three prompt rules force the wording to be
+  precise rather than blended: (1) the **block/field collision rule** —
+  `experience`'s own `projects`/`achievements`/`awards` fields (scoped to
+  one specific job) are a different concept from the top-level
+  `projects`/`achievements`/`awards` blocks (the candidate's own standalone
+  entries); a question about a specific job's projects/achievements/awards
+  reports `"block": "experience"` with the matching entries in `fields`,
+  never the standalone block name; (2) the **name-the-specific-item rule**
+  — for a repeatable block (`experience`/`education`/`projects`/
+  `certifications`/`courses`) with more than one item, a question about one
+  specific existing item must name that item's own identifying detail
+  (role/company, degree/college, or the item's name) rather than a bare
+  generic reference; (3) the **consolidate, don't drip-feed rule** (added
+  after a live run produced four separate rounds for one experience item's
+  four remaining open fields, asked one at a time) — before wording a
+  question for a candidate, check `field_completeness`'s per-item field
+  breakdown; if more than one field is still MISSING/PARTIAL for it, the
+  single question MUST cover all of them together (e.g. "where was your
+  internship at AI Solve based, and did you work on any specific projects,
+  achieve any notable results, or receive any awards during that role?"),
+  listing every field it addresses in `fields` — never split them across
+  separate rounds, even non-consecutive ones.
+
+  `question_chain._validate_next_target(target, candidates)` is the trust
+  boundary for the model's self-reported `next_question_target`: it must
+  name one of the given `next_target_candidates` by `(block, item_id)` —
+  a cheap containment check against a small Python-built list, not the old
+  `_sanitize_target`'s full coverage-schema validation, since every
+  candidate is already schema-valid by construction — with `fields`
+  narrowed to a subset of the matched candidate's own fields (falling back
+  to the candidate's full field list on an empty/unrecognized subset). Any
+  report that doesn't match a given candidate at all falls back to
+  `candidates[0]` — the single highest-priority pick — verbatim. This
+  validated value is what `InterviewDirector` stores on the round it opens;
+  a later `UNABLE_TO_ANSWER` grade on that round commits every field in
+  `fields` back into `field_completeness` in one patch via
   `build_unable_to_answer_patch` (below) — see
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md).
 - **`run_topic_question_chain(resume, coverage, conversation_history, topic_description, field_completeness=None) -> dict`**
@@ -192,25 +214,38 @@ session ends to clean up anything left ambiguous.
   (a signup/profile form), never through this interview. Used by
   `InterviewDirector`'s fused-call site (passed instead of `COVERAGE_SCHEMA`,
   see [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)) and by
-  `find_required_gap` below.
-- **`find_required_gap(field_completeness, coverage, *, exclude=frozenset()) -> Optional[dict]`**
-  (`required_gap.py`) — the deterministic Python safety net that stops the
-  interview from ending while something required is still missing. Filters
-  `coverage` through `askable_coverage_schema` first, then sorts the
-  remaining `importance == "required"` blocks by `objective_priority`, and
-  returns the first whose own top-level `completeness_status` in
-  `field_completeness` isn't in `completeness_status.TERMINAL_STATUSES` and
-  whose `"gap:<block>"` key isn't in `exclude`, as `{"block", "complete_when",
-  "forced_topic": f"gap:{block}"}`. `None` once every required block is
-  terminal or excluded. In `coverage_schema.py`'s current schema, `personal`
-  and `summary` are `required` but ALSO `not_applicable: true`, so
-  `askable_coverage_schema` removes them before the `required`-importance
-  filter ever runs — the only blocks that can actually surface here are
-  `experience`, `education`, `skills` (in that `objective_priority` order).
-  Called only from `InterviewDirector._advance_round`'s safety-net branch,
-  after a bounded catch-up (`_await_task_a_settle`) — see
-  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) and
-  [backend/completeness-pipeline.md](completeness-pipeline.md).
+  `compute_next_targets` below.
+- **`compute_next_targets(resume, coverage, field_completeness, *, exclude_targets=frozenset()) -> List[dict]`**
+  (`next_target.py`) — the deterministic, priority-ordered scanner that
+  replaced `run_question_chain`'s old free target-selection (and,
+  entirely, the narrower `required_gap.py`/`find_required_gap` it
+  superseded — deleted, no remaining callers). Filters `coverage` through
+  `askable_coverage_schema`, drops any block whose own top-level
+  `completeness_status` in `field_completeness` is already in
+  `completeness_status.TERMINAL_STATUSES` (a block with no verdict yet
+  defaults to open — same convention `required_gap.py` used), then splits
+  the rest into `touched` (`bool(resume.get(block))`) and `untouched`, each
+  sorted ascending by `objective_priority` (1 = highest). Walks
+  `touched + untouched` in that order building ONE candidate per block: a
+  block-level-only block, or an untouched item-level block, becomes
+  `{"block": block, "item_id": None, "fields": None}`; an item-level block
+  with existing items (`experience`/`education`/`projects`/
+  `certifications`/`courses`) walks `resume[block]`'s own items in resume
+  order and returns the first one with any open field as `{"block":
+  block, "item_id": item_id, "fields": open_fields}` — a block whose every
+  item is already field-terminal (despite a stale non-terminal block-level
+  status) contributes no candidate rather than one with empty `fields`.
+  `exclude_targets` (a set of `(block, item_id)` pairs) is skipped entirely
+  — the caller passes the round currently being graded (so it's never
+  immediately reselected as its own successor) plus every
+  `_organic_targets_given_up` pair (a block/item a prior round capped out
+  on while still non-terminal, so it doesn't loop the interview on a stuck
+  topic forever). Returns the **full** list, never truncated — an empty
+  list means every askable block is genuinely covered. See
+  `run_question_chain` above for how the fused call consumes this list, and
+  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for
+  `InterviewDirector._finish_answer`'s call site and
+  `_organic_targets_given_up`.
 - `run_resume_extraction_chain(resume, new_text) -> dict` — one incremental
   LLM call; returns `{reasoning, updates, unresolved, resolved_conflicts,
   resolved_unresolved_ids, remaining_text, status, _llm_usage}`. Never
@@ -375,6 +410,28 @@ presence-only `field_status.py` module this replaced has been deleted.
   transcript at once.
 
 ## Last synced
+2026-09-05 (yet later still — deterministic block-priority target selection,
+paired with the [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) change of
+the same name: added `next_target.py`'s `compute_next_targets` (touched
+blocks before untouched, each in `objective_priority` order, exhaustive and
+never truncated) as the Python-authoritative replacement for
+`run_question_chain`'s old free target-selection. `run_question_chain`
+gained `current_target`/`next_target_candidates` keyword params —
+`current_target` grounds `probe_question` in the round's own already-known
+subject instead of raw-text re-inference; `next_target_candidates` is the
+list the model must pick `next_question`'s subject from, never inventing
+one outside it. New `question_chain._validate_next_target` replaces
+`InterviewDirector._sanitize_target` (deleted) as the trust boundary for
+the model's self-reported `next_question_target` — cheaper now, since it
+only needs to check containment in a small Python-built list rather than
+validate against the whole coverage schema. Deleted `required_gap.py`/
+`find_required_gap` entirely: its narrower required-tier-only safety net
+has no remaining caller now that `compute_next_targets` is exhaustive by
+construction and there is no more fallback tier of any kind after the fused
+call — a null `next_question` goes straight to `_complete_interview()`. See
+[backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for the director-side
+half of this change, including the new `_organic_targets_given_up`
+loop-prevention set and the deleted `_await_task_a_settle`.)
 2026-09-05 (yet later still — trimmed `SYSTEM_PROMPT`/
 `TOPIC_QUESTION_SYSTEM_PROMPT` in `question_prompts.py` for latency:
 restructured with Markdown section headers (`# Identity`, `# Step 1:

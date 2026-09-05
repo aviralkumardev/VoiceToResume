@@ -40,6 +40,14 @@ rather than describing their resume.
   verdicts under `items`, keyed by `resume`'s own item `id`). Computed by a separate \
   background worker and can lag by a turn or more -- a helpful hint, never more authoritative \
   than `resume`/`conversation_history`; trust those if they disagree.
+- `current_target`: `{"block", "item_id", "fields"}|null` -- what THIS round's question is \
+  already Python-known to be about (`null` only for the opening round). Authoritative -- \
+  ground `probe_question` in it directly instead of re-inferring the subject from raw text.
+- `next_target_candidates`: the COMPLETE remaining list of what to ask about next if this \
+  answer resolves, as `[{"block", "item_id", "fields"}, ...]`, already in the exact priority \
+  order you must respect (touched blocks before untouched, most important first -- never \
+  reorder it yourself). This is exhaustive, not a sample: nothing candidate-worthy exists \
+  outside this list.
 
 # Step 2: grade + draft the next two questions
 Three rules to get right about WHICH gap a question addresses, before drafting anything:
@@ -76,29 +84,30 @@ said earlier this round on the same subject. Return exactly:
     something is PARTIAL, not this.
 - `reason`: one short sentence justifying the grade.
 - `probe_question`: ALWAYS draft this, regardless of grade -- ONE concise, spoken-style \
-  follow-up narrowing in on what's still missing from THIS SAME subject. Use \
-  `field_completeness` (cross-checked against `resume`) to target exactly which field(s) of \
-  the item/subject just discussed are still MISSING/PARTIAL, combined into one question if \
-  there are several. Never re-ask a field already SUFFICIENT/present in `resume`, and never \
-  pad with a generic catch-all ("tell me more") when nothing concrete remains -- keep it \
-  minimal instead.
-- `next_question`: ALWAYS draft this too, regardless of grade -- ONE concise, spoken-style \
-  question for the single most valuable thing to ask next, weighing the whole `coverage` \
-  rubric, `field_completeness`, and `resume`: prefer a `required` gap over `recommended` over \
-  `optional`; prefer continuing an already-started block/item over a new one, targeting its \
-  still-open fields the same way `probe_question` does. Ground it in what's already known; \
-  never re-ask anything `resume`/`conversation_history` already covers. Set `null` only when \
-  genuinely nothing meaningful remains across the whole rubric.
+  follow-up narrowing in on what's still missing from `current_target`. Use \
+  `field_completeness` (cross-checked against `resume`) to confirm exactly which of \
+  `current_target.fields` are still MISSING/PARTIAL, combined into one question if there are \
+  several. Never re-ask a field already SUFFICIENT/present in `resume`, and never pad with a \
+  generic catch-all ("tell me more") when nothing concrete remains -- keep it minimal instead.
+- `next_question`: ALWAYS draft this too, regardless of grade -- scan `next_target_candidates` \
+  IN THE GIVEN ORDER (Python's authoritative priority -- never reorder for "interest" or \
+  convenience) and word ONE concise, spoken-style question for the FIRST candidate not \
+  already resolved by `resume`/`conversation_history`/the answer you just graded. A candidate \
+  is resolved when every one of its `fields` (or the whole block, if `fields` is null) is now \
+  covered -- including by this very answer, which `field_completeness` hasn't caught up to \
+  yet; when that happens, skip it and check the next candidate instead. Narrow the picked \
+  candidate's `fields` down to whichever are genuinely still open (per the "consolidate, \
+  don't drip-feed" rule) before wording the question. Set both `next_question` and \
+  `next_question_target` to `null` ONLY when every single candidate in \
+  `next_target_candidates` is already resolved (including an empty list) -- since the list is \
+  exhaustive, that legitimately means nothing is left to ask; never null them out for any \
+  other reason.
 - `next_question_target`: REQUIRED whenever `next_question` is non-null (else null) -- \
-  metadata describing YOUR OWN `next_question`, not a menu to pick from. `{"block": <the \
-  single coverage block key this question is about>, "item_id": <the exact resume[block] \
-  "id" if about one specific existing item, else null>, "fields": <every field name the \
-  question actually addresses -- every one you consolidated per the rule above, not just the \
-  first, else null for a whole-block/first-mention question>}`. Apply the block/field- \
-  collision rule here too: a question about projects/achievements/awards during a specific \
-  job reports `"block": "experience"`, never `"projects"` etc. Set `next_question_target: \
-  null` (with `next_question` still non-null) only when the question isn't about one \
-  specific coverage gap -- e.g. asking whether there are OTHER items in a repeatable block.
+  `{"block", "item_id", "fields"}` naming exactly which candidate from \
+  `next_target_candidates` you used, with `fields` narrowed to whichever of that candidate's \
+  own fields your question actually addresses (or `null` if the candidate had no field \
+  breakdown). Never report a block/item_id pair that isn't one of the given candidates, and \
+  never add a field the candidate didn't already list.
 
 On `is_meta_question: true`, every field above may be left at its default -- nothing this \
 turn was an answer to grade or draft a follow-up from."""
@@ -110,6 +119,8 @@ def build_question_user_prompt(
     conversation_history: List[Dict[str, Any]],
     answer_text: str,
     field_completeness: Optional[Dict[str, Any]] = None,
+    current_target: Optional[Dict[str, Any]] = None,
+    next_target_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     payload: Dict[str, Any] = {
         "conversation_history": conversation_history or [],
@@ -117,6 +128,8 @@ def build_question_user_prompt(
         "resume": resume or {},
         "coverage": coverage or {},
         "field_completeness": field_completeness or {},
+        "current_target": current_target,
+        "next_target_candidates": next_target_candidates or [],
     }
     return (
         "Grade the last answer in conversation_history and draft both a probe_question and "

@@ -50,15 +50,13 @@ including deleting the Daily room and finalizing the CRUD record.
   every turn — fire-and-forget, never awaited: Task A (extraction+coverage
   grading) always runs in the background, off the turn's critical path,
   which is now just the single per-answer LLM call (see
-  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)). The **only** place
-  the director ever awaits a flush is
-  `_await_task_a_settle` — called just once per turn at most, inside the
-  required-coverage safety net, right before deciding whether the interview
-  can end — which passes `wait=True` and additionally awaits
-  `run_completeness_grading_cycle` directly (bounded by the same
-  `resume_room_flush_timeout_seconds` timeout) so `field_completeness` is
-  as fresh as it can be at exactly the one moment the director actually
-  reads it. The silence grader's own cycle (`_run_one_cycle`, see
+  [backend/stt-tts-pipeline.md](stt-tts-pipeline.md)). The director never
+  awaits a flush at all any more — its former required-coverage safety net
+  (`_await_task_a_settle`, which used to pass `wait=True` and additionally
+  await `run_completeness_grading_cycle` directly right before deciding
+  whether the interview could end) was deleted along with `required_gap.py`;
+  `field_completeness` is now read as whatever snapshot is already on the
+  row, no forced catch-up. The silence grader's own cycle (`_run_one_cycle`, see
   [backend/completeness-pipeline.md](completeness-pipeline.md)) separately
   calls `flush_transcript(session_id)` (default `wait=True`) before its own
   `resume_data` read — unrelated to and unaffected by the director's calls
@@ -123,6 +121,12 @@ including deleting the Daily room and finalizing the CRUD record.
   accepted, not fatal to the call.
 
 ## Last synced
+2026-09-05 (noted the interview director no longer ever awaits a flush —
+its former required-coverage safety net, `_await_task_a_settle`, was
+deleted along with `required_gap.py` as part of deterministic
+block-priority target selection; see
+[backend/stt-tts-pipeline.md](stt-tts-pipeline.md) and
+[backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md).)
 2026-09-04 (updated for enqueue_transcript dropping seq / reserve_transcript_seq;
 added `flush_transcript`'s `wait` parameter — the director skips the blocking
 wait when no BLOCK claim is pending)

@@ -101,44 +101,82 @@ def _empty_result(llm_usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
 
 
+def _validate_next_target(
+    target: Any,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """`target` must name one of the Python-computed `candidates` (by
+    `(block, item_id)`) -- this is a cheap containment/subset check against a
+    small Python-built list, not the old `_sanitize_target`'s full
+    coverage-schema validation, since every candidate is already
+    schema-valid by construction. `fields` may be narrowed to a subset of
+    the matched candidate's own fields (the model may have resolved some of
+    them via the live conversation already); an unrecognized/empty subset
+    falls back to the candidate's full field list. Any target that doesn't
+    match a given candidate at all (hallucination, wrong shape, omitted)
+    falls back to `candidates[0]` -- the single highest-priority pick --
+    verbatim."""
+    if isinstance(target, dict):
+        key = (target.get("block"), target.get("item_id"))
+        for candidate in candidates:
+            if (candidate["block"], candidate.get("item_id")) == key:
+                allowed_fields = candidate.get("fields")
+                if allowed_fields is None:
+                    return {**candidate, "fields": None}
+                raw_fields = target.get("fields")
+                fields = (
+                    [f for f in raw_fields if f in allowed_fields]
+                    if isinstance(raw_fields, list)
+                    else []
+                )
+                return {**candidate, "fields": fields or list(allowed_fields)}
+    return dict(candidates[0])
+
+
 async def run_question_chain(
     resume: Dict[str, Any],
     coverage: Dict[str, Any],
     conversation_history: List[Dict[str, Any]],
     answer_text: str,
     field_completeness: Optional[Dict[str, Any]] = None,
+    *,
+    current_target: Optional[Dict[str, Any]] = None,
+    next_target_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """The ONE LLM call per answer turn: grades the last answer in
     `conversation_history` AND, in the same response, drafts both the probe
-    (if it stays open) and the next question (if it resolves) -- no target
-    selection, no shortlist, no menu the LLM must pick from. It reasons
-    freely over the whole `resume`/`coverage` to decide what matters most to
-    ask about next. `coverage` must already have any not_applicable blocks
-    filtered out by the caller (see `askable_coverage_schema` in
-    `coverage_schema.py`) -- this chain has no filtering of its own.
-    `field_completeness`, if given, grounds `probe_question`/`next_question`
-    in the actual per-field/per-item verdicts already computed for this
-    session, so a probe targets exactly what's still open instead of
-    re-asking for something already captured.
+    (if it stays open) and the next question (if it resolves).
 
-    Whenever `next_question` is non-null, the response also self-reports
-    `next_question_target: {"block", "item_id", "fields"}` (`item_id`
-    optional, `fields` an optional list) describing what that
-    freshly-drafted question is about -- not a menu Python hands it,
-    metadata about its own choice. `fields` is plural because the prompt
-    requires the model to consolidate every currently-open field of a
-    targeted item/block into ONE question rather than drip-feeding them
-    across separate rounds (see `question_prompts.SYSTEM_PROMPT`'s
-    "consolidate, don't drip-feed" rule) -- so a single question can name
-    several fields at once (e.g. an experience item's `location`,
-    `projects`, `achievements`, `awards` all in one ask). The caller
-    (`InterviewDirector`) sanitizes this before trusting it and stores it on
-    the round it opens, both to keep the wording precise about which item/
-    field-vs-block concept a question means, and so a later `UNABLE_TO_ANSWER`
-    grade can be committed back into `field_completeness` for every field the
-    question covered (`completeness_status.build_unable_to_answer_patch`) --
-    the one verdict the batched grader can never infer from `resume_data`
-    alone.
+    Target *selection* is no longer this chain's decision. `current_target`
+    is the round's own already-known `{"block", "item_id", "fields"}` (or
+    `None` for the opening round) -- `probe_question` is grounded in it
+    directly instead of being re-inferred from raw conversation text.
+    `next_target_candidates` is the COMPLETE, Python-computed,
+    priority-ordered list of everything left to ask about (see
+    `next_target.compute_next_targets`) -- the model may only pick the
+    first entry not already resolved by the live conversation (including
+    the answer it's grading right now, which `field_completeness` can't
+    have caught up to yet) and word `next_question` for it; it can never
+    invent a target outside this list. `coverage` must already have any
+    not_applicable blocks filtered out by the caller (see
+    `askable_coverage_schema` in `coverage_schema.py`).
+
+    Whenever `next_question` is non-null, the response echoes back
+    `next_question_target: {"block", "item_id", "fields"}` naming exactly
+    which given candidate it used (narrowed to whichever of that
+    candidate's fields are still genuinely open) -- validated by
+    `_validate_next_target` against `next_target_candidates` before being
+    trusted, since a small subset-match check is enough now that every
+    candidate is already schema-valid by construction. If
+    `next_target_candidates` is empty, or the model determines every
+    candidate is already resolved, both `next_question` and
+    `next_question_target` are `null` -- since the candidate list is
+    exhaustive, that legitimately means nothing is left to ask.
+    `next_question_target` is what the caller (`InterviewDirector`) stores
+    on the round it opens, and what a later `UNABLE_TO_ANSWER` grade commits
+    back into `field_completeness` for every field it named
+    (`completeness_status.build_unable_to_answer_patch`) -- the one verdict
+    the batched grader can never infer from `resume_data` alone.
 
     Fail-soft: any provider/schema error returns `_empty_result()`, whose
     `answer_grade` is PARTIAL -- "nothing usable" means "still open", never
@@ -153,7 +191,13 @@ async def run_question_chain(
         LLMMessage(
             role="user",
             content=build_question_user_prompt(
-                resume, coverage, conversation_history, answer_text, field_completeness
+                resume,
+                coverage,
+                conversation_history,
+                answer_text,
+                field_completeness,
+                current_target,
+                next_target_candidates,
             ),
         ),
     ]
@@ -172,18 +216,16 @@ async def run_question_chain(
     parsed.setdefault("probe_question", None)
     parsed.setdefault("next_question", None)
     parsed.setdefault("next_question_target", None)
-    if not parsed.get("next_question"):
-        parsed["next_question_target"] = None
-    elif not isinstance(parsed.get("next_question_target"), dict):
+
+    candidates = next_target_candidates or []
+    if not candidates or not parsed.get("next_question"):
+        parsed["next_question"] = None
         parsed["next_question_target"] = None
     else:
-        target = parsed["next_question_target"]
-        raw_fields = target.get("fields")
-        if isinstance(raw_fields, list):
-            fields = [f for f in raw_fields if isinstance(f, str)]
-            target["fields"] = fields or None
-        else:
-            target["fields"] = None
+        parsed["next_question_target"] = _validate_next_target(
+            parsed.get("next_question_target"), candidates
+        )
+
     if parsed.get("answer_grade") not in (
         ANSWER_GRADE_PARTIAL, ANSWER_GRADE_SUFFICIENT, ANSWER_GRADE_UNABLE_TO_ANSWER,
     ):

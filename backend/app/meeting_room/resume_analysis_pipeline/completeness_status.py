@@ -416,8 +416,9 @@ def build_unable_to_answer_patch(
     something (a decline leaves no `resume_data` value, so
     `prune_for_judgment` has nothing to ever judge). `target` is
     `{"block", "item_id", "fields"}` (`item_id` optional, `fields` an
-    optional list) -- see `InterviewDirector._advance_round`/
-    `_sanitize_target` for how it's produced. A single declined question
+    optional list) -- see `InterviewDirector._open_round`/`_finish_answer`
+    and `question_chain._validate_next_target` for how it's produced. A
+    single declined question
     commonly names several fields at once (Round 3's "consolidate, don't
     drip-feed" rule), so every field in the list is committed in one patch,
     not just the first.

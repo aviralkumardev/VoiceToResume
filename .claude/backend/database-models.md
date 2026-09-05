@@ -190,10 +190,13 @@ only (no real database yet).
   preceding graded answer to measure from. See
   [backend/stt-tts-pipeline.md](stt-tts-pipeline.md) for exactly where each
   branch (organic next-question, forced conflict/unresolved topic,
-  required-gap safety net, same-round probe) captures and forwards it —
-  every branch's own extra work (LLM wording calls, `_await_task_a_settle`'s
-  bounded wait) is included, since the candidate is genuinely waiting through
-  all of it.
+  same-round probe) captures and forwards it — every branch's own extra
+  work (LLM wording calls) is included, since the candidate is genuinely
+  waiting through all of it. There is no required-gap safety-net branch any
+  more (`required_gap.py`/`_await_task_a_settle` deleted — see
+  [backend/resume-analysis-pipeline.md](resume-analysis-pipeline.md)); a
+  null next-question now ends the interview directly instead of taking a
+  fourth, bounded-wait branch.
 
 ## Last synced
 2026-09-05 (yet later still — added `turn_latency_seconds` to
